@@ -1,0 +1,21 @@
+services:
+  rocketsource:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./Data:/app/Data
+    command: ["python", "rocketsource_automation.py", "--out", "out.csv", "--log-level", "INFO"]
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./Data:/app/Data
+    command: ["python", "-m", "pytest", "-q"]
+    profiles: ["test"]
