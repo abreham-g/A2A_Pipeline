@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Iterable
 
 try:
@@ -16,6 +17,7 @@ except Exception:
     pass
 
 import psycopg
+from psycopg import sql
 
 from .errors import ConfigError
 
@@ -23,62 +25,51 @@ from .errors import ConfigError
 _LOG = logging.getLogger(__name__)
 
 
-_ENSURE_TEST_UNITED_STATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS "Core Data"."test_united_state" (
-    "ASIN" character varying PRIMARY KEY,
-    "US_BB_Price" numeric,
-    "Package_Weight" numeric,
-    "FBA_Fee" numeric,
-    "Referral_Fee" numeric,
-    "Shipping_Cost" numeric,
-    "Sales_Rank_Drops" integer,
-    "Category" character varying,
-    "created_at" timestamp without time zone,
-    "last_updated" timestamp without time zone,
-    "Seller" character varying
-);
-"""
+def _redact_dsn(dsn: str) -> str:
+    dsn = (dsn or "").strip()
+    if not dsn:
+        return ""
+    if dsn.startswith("postgres://") or dsn.startswith("postgresql://"):
+        try:
+            u = urlparse(dsn)
+            netloc = u.hostname or ""
+            if u.port:
+                netloc = f"{netloc}:{u.port}"
+            if u.username:
+                netloc = f"{u.username}@{netloc}" if netloc else f"{u.username}@"
+            path = u.path or ""
+            return f"{u.scheme}://{netloc}{path}"
+        except Exception:
+            return "postgresql://<redacted>"
+    parts = []
+    for token in dsn.split():
+        if token.lower().startswith("password="):
+            parts.append("password=<redacted>")
+        else:
+            parts.append(token)
+    return " ".join(parts)
 
 
-_UPSERT_TEST_UNITED_STATE_SQL = """
-INSERT INTO "Core Data"."test_united_state" (
-    "ASIN",
-    "US_BB_Price",
-    "Package_Weight",
-    "FBA_Fee",
-    "Referral_Fee",
-    "Shipping_Cost",
-    "Sales_Rank_Drops",
-    "Category",
-    "created_at",
-    "last_updated",
-    "Seller"
-) VALUES (
-    %(ASIN)s,
-    %(US_BB_Price)s,
-    %(Package_Weight)s,
-    %(FBA_Fee)s,
-    %(Referral_Fee)s,
-    %(Shipping_Cost)s,
-    %(Sales_Rank_Drops)s,
-    %(Category)s,
-    %(created_at)s,
-    %(last_updated)s,
-    %(Seller)s
-)
-ON CONFLICT ("ASIN") DO UPDATE
-SET
-    "US_BB_Price" = EXCLUDED."US_BB_Price",
-    "Package_Weight" = EXCLUDED."Package_Weight",
-    "FBA_Fee" = EXCLUDED."FBA_Fee",
-    "Referral_Fee" = EXCLUDED."Referral_Fee",
-    "Shipping_Cost" = EXCLUDED."Shipping_Cost",
-    "Sales_Rank_Drops" = EXCLUDED."Sales_Rank_Drops",
-    "Category" = EXCLUDED."Category",
-    "created_at" = COALESCE("Core Data"."test_united_state"."created_at", EXCLUDED."created_at"),
-    "last_updated" = EXCLUDED."last_updated",
-    "Seller" = EXCLUDED."Seller";
-"""
+def _env_str(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = v.strip()
+    return v if v else default
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return default
+    try:
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def _qual(schema_name: str, table_name: str):
+    return sql.SQL(".").join([sql.Identifier(schema_name), sql.Identifier(table_name)])
 
 
 def _db_url() -> str:
@@ -100,75 +91,42 @@ class UngatedRow:
     update_date: datetime
 
 
-_SELECT_SQL = """
-                WITH combined_data AS (
-                    SELECT 
-                        COALESCE(t.asin, u.asin) as asin,
-                        'UNGATED' as status,
-                        CASE 
-                            WHEN t.status = 'UNGATED' AND u.status = 'UNGATED' THEN 'B'
-                            WHEN t.status != 'UNGATED' AND u.status = 'UNGATED' THEN 'T'
-                            WHEN t.status = 'UNGATED' AND u.status != 'UNGATED' THEN 'U'
-                        END as seller
-                    FROM "gated"."tirhak_gating_results_avg_tools_asins" t
-                    FULL OUTER JOIN "Core Data"."umair_gating_results_tools" u 
-                        ON t.asin = u.asin
-                )
-                SELECT asin, status, seller
-                FROM combined_data
-                WHERE seller IS NOT NULL
-                ORDER BY seller, asin limit 10;
-                """
-
-
-_ENSURE_TEST_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS "Core Data"."test_avg_book_sports_cd_tools_toys_ungated" (
-    asin character varying PRIMARY KEY,
-    status character varying NOT NULL,
-    seller character varying,
-    update_date timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-"""
-
-
-_UPSERT_TEST_TABLE_SQL = """
-WITH combined_data AS (
-    SELECT
-        COALESCE(t.asin, u.asin) as asin,
-        'UNGATED' as status,
-        CASE
-            WHEN t.status = 'UNGATED' AND u.status = 'UNGATED' THEN 'B'
-            WHEN t.status != 'UNGATED' AND u.status = 'UNGATED' THEN 'T'
-            WHEN t.status = 'UNGATED' AND u.status != 'UNGATED' THEN 'U'
-        END as seller
-    FROM "gated"."tirhak_gating_results_avg_tools_asins" t
-    FULL OUTER JOIN "Core Data"."umair_gating_results_tools" u
-        ON t.asin = u.asin
-),
-selected AS (
-    SELECT asin, status, seller
-    FROM combined_data
-    WHERE seller IS NOT NULL
-    ORDER BY seller, asin
-    LIMIT 10
-)
-INSERT INTO "Core Data"."test_avg_book_sports_cd_tools_toys_ungated" (asin, status, seller, update_date)
-SELECT asin, status, seller, CURRENT_TIMESTAMP
-FROM selected
-ON CONFLICT (asin) DO UPDATE
-SET
-    status = EXCLUDED.status,
-    seller = EXCLUDED.seller,
-    update_date = EXCLUDED.update_date
-RETURNING asin, status, seller, update_date;
-"""
-
-
 class DbService:
     def __init__(self, dsn: str | None = None) -> None:
         self._dsn = dsn or _db_url()
         self._connect_timeout_s: int | None = None
         self._statement_timeout_ms: int | None = None
+
+        self._target_schema = _env_str("ROCKETSOURCE_TARGET_SCHEMA", "Core Data")
+        self._ungated_table = _env_str(
+            "ROCKETSOURCE_UNGATED_TABLE",
+            "test_avg_book_sports_cd_tools_toys_ungated",
+        )
+        self._united_state_table = _env_str("ROCKETSOURCE_UNITED_STATE_TABLE", "test_united_state")
+
+        self._tirhak_schema = _env_str("ROCKETSOURCE_TIRHAK_SCHEMA", "gated")
+        self._tirhak_table = _env_str("ROCKETSOURCE_TIRHAK_TABLE", "tirhak_gating_results_avg_tools_asins")
+        self._umair_schema = _env_str("ROCKETSOURCE_UMAIR_SCHEMA", "Core Data")
+        self._umair_table = _env_str("ROCKETSOURCE_UMAIR_TABLE", "umair_gating_results_tools")
+
+        self._asin_limit = _env_int("ROCKETSOURCE_ASIN_LIMIT", 100)
+
+        _LOG.info("DB: target=%s", _redact_dsn(self._dsn))
+        _LOG.info(
+            'DB: output tables=%s.%s (ungated), %s.%s (united_state)',
+            self._target_schema,
+            self._ungated_table,
+            self._target_schema,
+            self._united_state_table,
+        )
+        _LOG.info(
+            'DB: source tables=%s.%s (tirhak), %s.%s (umair)',
+            self._tirhak_schema,
+            self._tirhak_table,
+            self._umair_schema,
+            self._umair_table,
+        )
+        _LOG.info("DB: asin_limit=%s", self._asin_limit)
 
         try:
             v = os.environ.get("ROCKETSOURCE_DB_CONNECT_TIMEOUT_S")
@@ -184,6 +142,124 @@ class DbService:
         except Exception:
             self._statement_timeout_ms = None
 
+    def _ensure_schema(self, cur, schema_name: str) -> None:
+        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {};").format(sql.Identifier(schema_name)))
+
+    def _ensure_ungated_table(self, cur) -> None:
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {} (
+                    asin character varying PRIMARY KEY,
+                    status character varying NOT NULL,
+                    seller character varying,
+                    update_date timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            ).format(_qual(self._target_schema, self._ungated_table))
+        )
+
+    def _ensure_united_state_table(self, cur) -> None:
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {} (
+                    "ASIN" character varying PRIMARY KEY,
+                    "US_BB_Price" numeric,
+                    "Package_Weight" numeric,
+                    "FBA_Fee" numeric,
+                    "Referral_Fee" numeric,
+                    "Shipping_Cost" numeric,
+                    "Category" character varying,
+                    "created_at" timestamp without time zone,
+                    "last_updated" timestamp without time zone,
+                    "Seller" character varying
+                );
+                """
+            ).format(_qual(self._target_schema, self._united_state_table))
+        )
+
+    def _upsert_ungated_rows_sql(self) -> sql.SQL:
+        return sql.SQL(
+            """
+            WITH combined_data AS (
+                SELECT
+                    COALESCE(t.asin, u.asin) as asin,
+                    'UNGATED' as status,
+                    CASE
+                        WHEN t.status = 'UNGATED' AND u.status = 'UNGATED' THEN 'B'
+                        WHEN t.status != 'UNGATED' AND u.status = 'UNGATED' THEN 'T'
+                        WHEN t.status = 'UNGATED' AND u.status != 'UNGATED' THEN 'U'
+                    END as seller
+                FROM {} t
+                FULL OUTER JOIN {} u
+                    ON t.asin = u.asin
+            ),
+            selected AS (
+                SELECT asin, status, seller
+                FROM combined_data
+                WHERE seller IS NOT NULL
+                ORDER BY seller, asin
+                LIMIT {limit}
+            )
+            INSERT INTO {} (asin, status, seller, update_date)
+            SELECT asin, status, seller, CURRENT_TIMESTAMP
+            FROM selected
+            ON CONFLICT (asin) DO UPDATE
+            SET
+                status = EXCLUDED.status,
+                seller = EXCLUDED.seller,
+                update_date = EXCLUDED.update_date
+            RETURNING asin, status, seller, update_date;
+            """
+        ).format(
+            _qual(self._tirhak_schema, self._tirhak_table),
+            _qual(self._umair_schema, self._umair_table),
+            _qual(self._target_schema, self._ungated_table),
+            limit=sql.Literal(self._asin_limit),
+        )
+
+    def _upsert_united_state_sql(self) -> sql.SQL:
+        dest = _qual(self._target_schema, self._united_state_table)
+        return sql.SQL(
+            """
+            INSERT INTO {} (
+                "ASIN",
+                "US_BB_Price",
+                "Package_Weight",
+                "FBA_Fee",
+                "Referral_Fee",
+                "Shipping_Cost",
+                "Category",
+                "created_at",
+                "last_updated",
+                "Seller"
+            ) VALUES (
+                %(ASIN)s,
+                %(US_BB_Price)s,
+                %(Package_Weight)s,
+                %(FBA_Fee)s,
+                %(Referral_Fee)s,
+                %(Shipping_Cost)s,
+                %(Category)s,
+                %(created_at)s,
+                %(last_updated)s,
+                %(Seller)s
+            )
+            ON CONFLICT ("ASIN") DO UPDATE
+            SET
+                "US_BB_Price" = EXCLUDED."US_BB_Price",
+                "Package_Weight" = EXCLUDED."Package_Weight",
+                "FBA_Fee" = EXCLUDED."FBA_Fee",
+                "Referral_Fee" = EXCLUDED."Referral_Fee",
+                "Shipping_Cost" = EXCLUDED."Shipping_Cost",
+                "Category" = EXCLUDED."Category",
+                "created_at" = COALESCE({}."created_at", EXCLUDED."created_at"),
+                "last_updated" = EXCLUDED."last_updated",
+                "Seller" = EXCLUDED."Seller";
+            """
+        ).format(dest, dest)
+
     def fetch_new_ungated_rows(self) -> list[UngatedRow]:
         """Run the ungated ASINs query, store rows into the test table, and return them."""
         rows: list[UngatedRow] = []
@@ -196,14 +272,14 @@ class DbService:
                 if self._statement_timeout_ms is not None and self._statement_timeout_ms > 0:
                     cur.execute(f"SET LOCAL statement_timeout = {self._statement_timeout_ms}")
 
-                _LOG.info('DB: ensuring schema "Core Data" exists...')
-                cur.execute('CREATE SCHEMA IF NOT EXISTS "Core Data";')
+                _LOG.info('DB: ensuring schema "%s" exists...', self._target_schema)
+                self._ensure_schema(cur, self._target_schema)
 
-                _LOG.info('DB: ensuring table "Core Data"."test_avg_book_sports_cd_tools_toys_ungated" exists...')
-                cur.execute(_ENSURE_TEST_TABLE_SQL)
+                _LOG.info('DB: ensuring table "%s"."%s" exists...', self._target_schema, self._ungated_table)
+                self._ensure_ungated_table(cur)
 
                 _LOG.info("DB: selecting + storing ungated ASIN rows...")
-                cur.execute(_UPSERT_TEST_TABLE_SQL)
+                cur.execute(self._upsert_ungated_rows_sql())
 
                 _LOG.info("DB: query executed (%.1fs). Fetching rows...", time.time() - t0)
                 for r in cur.fetchall():
@@ -237,17 +313,6 @@ class DbService:
             except Exception:
                 return None
 
-        def _parse_int(v: str | None) -> int | None:
-            if v is None:
-                return None
-            s = v.strip()
-            if s == "":
-                return None
-            try:
-                return int(float(s))
-            except Exception:
-                return None
-
         def _parse_dt(v: str | None) -> datetime | None:
             if v is None:
                 return None
@@ -277,7 +342,6 @@ class DbService:
                         "FBA_Fee": _parse_decimal(row.get("FBA_Fee")),
                         "Referral_Fee": _parse_decimal(row.get("Referral_Fee")),
                         "Shipping_Cost": _parse_decimal(row.get("Shipping_Cost")),
-                        "Sales_Rank_Drops": _parse_int(row.get("Sales_Rank_Drops")),
                         "Category": (row.get("Category") or "").strip() or None,
                         "created_at": _parse_dt(row.get("created_at")),
                         "last_updated": _parse_dt(row.get("last_updated")),
@@ -290,11 +354,26 @@ class DbService:
 
         with psycopg.connect(self._dsn) as conn:
             with conn.cursor() as cur:
-                cur.execute('CREATE SCHEMA IF NOT EXISTS "Core Data";')
-                cur.execute(_ENSURE_TEST_UNITED_STATE_TABLE_SQL)
-                cur.executemany(_UPSERT_TEST_UNITED_STATE_SQL, rows)
+                self._ensure_schema(cur, self._target_schema)
+                self._ensure_united_state_table(cur)
+                cur.executemany(self._upsert_united_state_sql(), rows)
 
-        _LOG.info('DB: upserted %d rows into "Core Data"."test_united_state"', len(rows))
+            conn.commit()
+
+        try:
+            with psycopg.connect(self._dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        sql.SQL("SELECT COUNT(*) FROM {};").format(
+                            _qual(self._target_schema, self._united_state_table)
+                        )
+                    )
+                    total = cur.fetchone()[0]
+            _LOG.info('DB: "%s"."%s" total rows=%s', self._target_schema, self._united_state_table, total)
+        except Exception:
+            pass
+
+        _LOG.info('DB: upserted %d rows into "%s"."%s"', len(rows), self._target_schema, self._united_state_table)
         return len(rows)
 
 

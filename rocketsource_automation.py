@@ -1,6 +1,7 @@
 import csv
 import logging
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -40,6 +41,22 @@ class RocketSourceAutomation:
         return cfg.data_dir / p
 
     @staticmethod
+    def _strip_out_flag(argv: list[str]) -> list[str]:
+        out: list[str] = []
+        skip_next = False
+        for a in argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if a == "--out":
+                skip_next = True
+                continue
+            if a.startswith("--out="):
+                continue
+            out.append(a)
+        return out
+
+    @staticmethod
     def _normalize_results_csv(
         in_path: Path,
         out_path: Path,
@@ -68,7 +85,6 @@ class RocketSourceAutomation:
                         "FBA_Fee",
                         "Referral_Fee",
                         "Shipping_Cost",
-                        "Sales_Rank_Drops",
                         "Category",
                         "created_at",
                         "last_updated",
@@ -86,15 +102,6 @@ class RocketSourceAutomation:
                             "FBA_Fee": pick(row, ["FBA Fees"]),
                             "Referral_Fee": pick(row, ["Referral Fee"]),
                             "Shipping_Cost": pick(row, ["Inbound Shipping"]),
-                            "Sales_Rank_Drops": pick(
-                                row,
-                                [
-                                    "Sales Rank Drops 30d",
-                                    "Sales Rank Drops 60d",
-                                    "Sales Rank Drops 90d",
-                                    "Sales Rank Drops 180d",
-                                ],
-                            ),
                             "Category": pick(row, ["Category"]),
                             "created_at": created_at,
                             "last_updated": created_at,
@@ -117,26 +124,30 @@ class RocketSourceAutomation:
             print("No new ASINs to scan (query returned 0 rows).")
             return 0
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        input_csv = self._cfg.data_dir / f"db_input_{stamp}.csv"
-        self._write_asin_price_csv(input_csv, asins)
-
         argv = self._argv_without_positional_csv()
-        out_path = self._out_path(self._cfg, argv)
-        rc = main([str(input_csv), *argv])
+        argv = self._strip_out_flag(argv)
 
-        if rc == 0 and out_path.exists():
-            normalized_path = out_path.with_name(out_path.stem + "_normalized.csv")
-            self._normalize_results_csv(out_path, normalized_path, asin_to_seller, datetime.now())
-            logging.getLogger("rocketsource").info("Normalized results saved to %s", normalized_path)
+        with tempfile.TemporaryDirectory(prefix="rocketsource_") as tmp:
+            tmp_dir = Path(tmp)
+            input_csv = tmp_dir / "input.csv"
+            out_path = tmp_dir / "results.csv"
+            normalized_path = tmp_dir / "results_normalized.csv"
 
-            count = upsert_normalized_csv_to_test_united_state(normalized_path)
-            logging.getLogger("rocketsource").info(
-                'Upserted %d rows into "Core Data"."test_united_state"',
-                count,
-            )
+            self._write_asin_price_csv(input_csv, asins)
 
-        return rc
+            # Force the RocketSource CLI to write results into a temp file so we don't
+            # persist any CSV output into Data/ (or user-provided --out paths).
+            rc = main([str(input_csv), "--out", str(out_path), *argv])
+
+            if rc == 0 and out_path.exists():
+                self._normalize_results_csv(out_path, normalized_path, asin_to_seller, datetime.now())
+                count = upsert_normalized_csv_to_test_united_state(normalized_path)
+                logging.getLogger("rocketsource").info(
+                    "Upserted %d rows into target database table (see DB logs for schema/table)",
+                    count,
+                )
+
+            return rc
 
 
 if __name__ == "__main__":
