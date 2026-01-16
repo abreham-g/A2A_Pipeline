@@ -1,0 +1,1 @@
+worker: python rocketsource_automation.py --log-level DEBUG
