@@ -192,7 +192,7 @@ class DbService:
                     "ASIN" character varying PRIMARY KEY,
                     "US_BB_Price" numeric NOT NULL DEFAULT 0,
                     "Package_Weight" numeric,
-                    "FBA_Fee" numeric,
+                    "FBA_Fee" numeric NOT NULL DEFAULT 0,
                     "Referral_Fee" numeric NOT NULL DEFAULT 0,
                     "Shipping_Cost" numeric NOT NULL DEFAULT 0,
                     "Sales_Rank_Drops" integer DEFAULT 0,
@@ -352,6 +352,150 @@ class DbService:
         
         return rows
 
+    # def upsert_normalized_csv_to_test_united_state(self, csv_path: Path) -> int:
+        """Upsert normalized CSV data into the united_state table."""
+        
+        def _parse_decimal_required(v: Optional[str]) -> Decimal:
+            """Parse string to Decimal safely, returning 0.00 for null/empty."""
+            if v is None:
+                return Decimal('0.00')
+            s = v.strip()
+            if s == "":
+                return Decimal('0.00')
+            try:
+                # Remove any non-numeric characters except decimal point and minus sign
+                cleaned = ''.join(c for c in s if c.isdigit() or c in '.-')
+                if not cleaned:
+                    return Decimal('0.00')
+                return Decimal(cleaned)
+            except (InvalidOperation, ValueError):
+                return Decimal('0.00')
+
+        def _parse_decimal_optional(v: Optional[str]) -> Optional[Decimal]:
+            """Parse string to Decimal safely, returning None for null/empty."""
+            if v is None:
+                return None
+            s = v.strip()
+            if s == "":
+                return None
+            try:
+                cleaned = ''.join(c for c in s if c.isdigit() or c in '.-')
+                if not cleaned:
+                    return None
+                return Decimal(cleaned)
+            except (InvalidOperation, ValueError):
+                return None
+
+        def _parse_int(v: Optional[str]) -> int:
+            """Parse string to integer safely."""
+            if v is None:
+                return 0
+            s = v.strip()
+            if s == "":
+                return 0
+            try:
+                # Try to parse as float first to handle decimal strings
+                return int(float(s))
+            except (ValueError, TypeError):
+                return 0
+
+        def _parse_dt(v: Optional[str]) -> Optional[datetime]:
+            """Parse string to datetime safely."""
+            if v is None:
+                return None
+            s = v.strip()
+            if s == "":
+                return None
+            
+            # Try multiple date formats
+            date_formats = [
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%d",
+                "%m/%d/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M",
+                "%m/%d/%Y"
+            ]
+            
+            for fmt in date_formats:
+                try:
+                    return datetime.strptime(s, fmt)
+                except ValueError:
+                    continue
+            
+            return None
+
+        if self._enable_logging:
+            _LOG.info("DB: processing CSV file: %s", csv_path)
+        
+        rows: List[Dict[str, Any]] = []
+        processed_count = 0
+        skipped_count = 0
+        
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8") as f:
+                reader = _csv.DictReader(f)
+                
+                # Validate required columns
+                required_columns = {"ASIN"}
+                missing_columns = required_columns - set(reader.fieldnames or [])
+                if missing_columns:
+                    raise ValueError(f"Missing required columns in CSV: {missing_columns}")
+                
+                for row_num, row in enumerate(reader, start=1):
+                    asin = (row.get("ASIN") or "").strip()
+                    if not asin:
+                        skipped_count += 1
+                        if self._enable_logging and skipped_count <= 10:
+                            _LOG.warning("DB: Skipping row %d: missing ASIN", row_num)
+                        continue
+
+                    processed_data = {
+                        "ASIN": asin,
+                        "US_BB_Price": _parse_decimal_required(row.get("US_BB_Price")),
+                        "Package_Weight": _parse_decimal_optional(row.get("Package_Weight")),
+                        "FBA_Fee": _parse_decimal_required(row.get("FBA_Fee")),
+                        "Referral_Fee": _parse_decimal_required(row.get("Referral_Fee")),
+                        "Shipping_Cost": _parse_decimal_required(row.get("Shipping_Cost")),
+                        "Sales_Rank_Drops": _parse_int(row.get("Sales_Rank_Drops")),
+                        "Category": (row.get("Category") or "").strip() or None,
+                        "created_at": _parse_dt(row.get("created_at")),
+                        "last_updated": _parse_dt(row.get("last_updated")),
+                        "Seller": (row.get("Seller") or "").strip() or None,
+                    }
+                    
+                    rows.append(processed_data)
+                    processed_count += 1
+                    
+                    # Batch insert if we have enough rows
+                    if len(rows) >= self._batch_size:
+                        self._batch_insert_united_state(rows)
+                        rows = []
+        
+        except Exception as e:
+            _LOG.error("DB: Error reading CSV file %s: %s", csv_path, e)
+            raise
+
+        if self._enable_logging:
+            _LOG.info("DB: processed %d rows, skipped %d rows", processed_count, skipped_count)
+
+        if not rows:
+            return 0
+
+        # Insert remaining rows
+        inserted_count = self._batch_insert_united_state(rows)
+
+        # Get total count
+        try:
+            total = self._get_table_count(self._target_schema, self._united_state_table)
+            if self._enable_logging:
+                _LOG.info('DB: "%s"."%s" total rows=%s', self._target_schema, self._united_state_table, total)
+        except Exception as e:
+            if self._enable_logging:
+                _LOG.warning("DB: Could not get table count: %s", e)
+
+        return inserted_count
+
     def upsert_normalized_csv_to_test_united_state(self, csv_path: Path) -> int:
         """Upsert normalized CSV data into the united_state table."""
         
@@ -454,7 +598,7 @@ class DbService:
                         "ASIN": asin,
                         "US_BB_Price": _parse_decimal_required(row.get("US_BB_Price")),
                         "Package_Weight": _parse_decimal_optional(row.get("Package_Weight")),
-                        "FBA_Fee": _parse_decimal_optional(row.get("FBA_Fee")),
+                        "FBA_Fee": _parse_decimal_required(row.get("FBA_Fee")),  # REQUIRED
                         "Referral_Fee": _parse_decimal_required(row.get("Referral_Fee")),
                         "Shipping_Cost": _parse_decimal_required(row.get("Shipping_Cost")),
                         "Sales_Rank_Drops": _parse_int(row.get("Sales_Rank_Drops")),
