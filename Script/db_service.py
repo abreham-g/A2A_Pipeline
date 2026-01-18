@@ -2,11 +2,12 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
-from typing import Iterable
+from typing import Iterable, Optional, List, Dict, Any
+import csv as _csv
 
 try:
     from dotenv import load_dotenv
@@ -25,6 +26,7 @@ _LOG = logging.getLogger(__name__)
 
 
 def _redact_dsn(dsn: str) -> str:
+    """Redact password from database connection string for logging."""
     dsn = (dsn or "").strip()
     if not dsn:
         return ""
@@ -50,6 +52,7 @@ def _redact_dsn(dsn: str) -> str:
 
 
 def _env_str(name: str, default: str = "") -> str:
+    """Get environment variable as string with default."""
     v = os.environ.get(name)
     if v is None:
         return default
@@ -58,6 +61,7 @@ def _env_str(name: str, default: str = "") -> str:
 
 
 def _env_int(name: str, default: int = 0) -> int:
+    """Get environment variable as integer with default."""
     v = os.environ.get(name)
     if v is None or v.strip() == "":
         return default
@@ -67,17 +71,30 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
-def _qual(schema_name: str, table_name: str):
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Get environment variable as boolean."""
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    return v in ("true", "yes", "1", "on")
+
+
+def _qual(schema_name: str, table_name: str) -> sql.Composed:
+    """Create a qualified table identifier."""
     return sql.SQL(".").join([sql.Identifier(schema_name), sql.Identifier(table_name)])
 
 
 def _db_url() -> str:
     """Return the database URL from environment variables."""
-    for key in ("ROCKETSOURCE_DB_URL", "DATABASE_URL", "DB_URL", "POSTGRES_URL"):
+    env_vars = ("ROCKETSOURCE_DB_URL", "DATABASE_URL", "DB_URL", "POSTGRES_URL")
+    for key in env_vars:
         v = os.environ.get(key)
         if v and v.strip():
             return v.strip()
-    raise ConfigError("Missing database URL. Set ROCKETSOURCE_DB_URL (or DATABASE_URL/DB_URL/POSTGRES_URL).")
+    raise ConfigError(
+        f"Missing database URL. Set one of: {', '.join(env_vars)}."
+    )
 
 
 @dataclass(frozen=True)
@@ -91,11 +108,15 @@ class UngatedRow:
 
 
 class DbService:
-    def __init__(self, dsn: str | None = None) -> None:
+    """Database service for managing RocketSource data."""
+    
+    def __init__(self, dsn: Optional[str] = None) -> None:
+        """Initialize database service with connection string and configuration."""
         self._dsn = dsn or _db_url()
-        self._connect_timeout_s: int | None = None
-        self._statement_timeout_ms: int | None = None
+        self._connect_timeout_s: Optional[int] = None
+        self._statement_timeout_ms: Optional[int] = None
 
+        # Target tables configuration
         self._target_schema = _env_str("ROCKETSOURCE_TARGET_SCHEMA", "public")
         self._ungated_table = _env_str(
             "ROCKETSOURCE_UNGATED_TABLE",
@@ -103,27 +124,32 @@ class DbService:
         )
         self._united_state_table = _env_str("ROCKETSOURCE_UNITED_STATE_TABLE", "test_united_state")
 
+        # Source tables configuration
         self._tirhak_schema = _env_str("ROCKETSOURCE_TIRHAK_SCHEMA", "public")
         self._tirhak_table = _env_str("ROCKETSOURCE_TIRHAK_TABLE", "tirhak_gating_results")
         self._umair_schema = _env_str("ROCKETSOURCE_UMAIR_SCHEMA", "public")
         self._umair_table = _env_str("ROCKETSOURCE_UMAIR_TABLE", "umair_gating_results")
 
-        _LOG.info("DB: target=%s", _redact_dsn(self._dsn))
-        _LOG.info(
-            'DB: output tables=%s.%s (ungated), %s.%s (united_state)',
-            self._target_schema,
-            self._ungated_table,
-            self._target_schema,
-            self._united_state_table,
-        )
-        _LOG.info(
-            'DB: source tables=%s.%s (tirhak), %s.%s (umair)',
-            self._tirhak_schema,
-            self._tirhak_table,
-            self._umair_schema,
-            self._umair_table,
-        )
+        # Performance and logging settings
+        self._batch_size = _env_int("ROCKETSOURCE_DB_BATCH_SIZE", 1000)
+        self._enable_logging = _env_bool("ROCKETSOURCE_DB_ENABLE_LOGGING", True)
 
+        # Log configuration
+        if self._enable_logging:
+            _LOG.info("DB: target=%s", _redact_dsn(self._dsn))
+            _LOG.info(
+                'DB: output tables=%s.%s (ungated), %s.%s (united_state)',
+                self._target_schema, self._ungated_table,
+                self._target_schema, self._united_state_table
+            )
+            _LOG.info(
+                'DB: source tables=%s.%s (tirhak), %s.%s (umair)',
+                self._tirhak_schema, self._tirhak_table,
+                self._umair_schema, self._umair_table
+            )
+            _LOG.info("DB: batch_size=%d", self._batch_size)
+
+        # Timeout configuration
         try:
             v = os.environ.get("ROCKETSOURCE_DB_CONNECT_TIMEOUT_S")
             if v and v.strip():
@@ -139,9 +165,11 @@ class DbService:
             self._statement_timeout_ms = None
 
     def _ensure_schema(self, cur, schema_name: str) -> None:
+        """Create schema if it doesn't exist."""
         cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {};").format(sql.Identifier(schema_name)))
 
     def _ensure_ungated_table(self, cur) -> None:
+        """Create ungated table if it doesn't exist."""
         cur.execute(
             sql.SQL(
                 """
@@ -156,6 +184,7 @@ class DbService:
         )
 
     def _ensure_united_state_table(self, cur) -> None:
+        """Create united_state table if it doesn't exist."""
         cur.execute(
             sql.SQL(
                 """
@@ -176,7 +205,8 @@ class DbService:
             ).format(_qual(self._target_schema, self._united_state_table))
         )
 
-    def _upsert_ungated_rows_sql(self) -> sql.SQL:
+    def _upsert_ungated_rows_sql(self) -> sql.Composed:
+        """Generate SQL for upserting ungated rows."""
         return sql.SQL(
             """
             WITH combined_data AS (
@@ -214,7 +244,8 @@ class DbService:
             _qual(self._target_schema, self._ungated_table),
         )
 
-    def _upsert_united_state_sql(self) -> sql.SQL:
+    def _upsert_united_state_sql(self) -> sql.Composed:
+        """Generate SQL for upserting united_state rows."""
         dest = _qual(self._target_schema, self._united_state_table)
         return sql.SQL(
             """
@@ -258,93 +289,152 @@ class DbService:
             """
         ).format(dest, dest)
 
-    def fetch_new_ungated_rows(self) -> list[UngatedRow]:
+    def fetch_new_ungated_rows(self) -> List[UngatedRow]:
         """Run the ungated ASINs query, store rows into the test table, and return them."""
-        rows: list[UngatedRow] = []
+        rows: List[UngatedRow] = []
 
-        _LOG.info("DB: connecting...")
+        if self._enable_logging:
+            _LOG.info("DB: connecting...")
+        
         t0 = time.time()
 
-        with psycopg.connect(self._dsn, connect_timeout=self._connect_timeout_s) as conn:
-            with conn.cursor() as cur:
-                if self._statement_timeout_ms is not None and self._statement_timeout_ms > 0:
-                    cur.execute(f"SET LOCAL statement_timeout = {self._statement_timeout_ms}")
+        try:
+            with psycopg.connect(self._dsn, connect_timeout=self._connect_timeout_s) as conn:
+                with conn.cursor() as cur:
+                    if self._statement_timeout_ms is not None and self._statement_timeout_ms > 0:
+                        cur.execute(f"SET LOCAL statement_timeout = {self._statement_timeout_ms}")
 
-                _LOG.info('DB: ensuring schema "%s" exists...', self._target_schema)
-                self._ensure_schema(cur, self._target_schema)
+                    if self._enable_logging:
+                        _LOG.info('DB: ensuring schema "%s" exists...', self._target_schema)
+                    self._ensure_schema(cur, self._target_schema)
 
-                _LOG.info('DB: ensuring table "%s"."%s" exists...', self._target_schema, self._ungated_table)
-                self._ensure_ungated_table(cur)
+                    if self._enable_logging:
+                        _LOG.info('DB: ensuring table "%s"."%s" exists...', self._target_schema, self._ungated_table)
+                    self._ensure_ungated_table(cur)
 
-                _LOG.info("DB: selecting + storing ungated ASIN rows...")
-                cur.execute(self._upsert_ungated_rows_sql())
+                    if self._enable_logging:
+                        _LOG.info("DB: selecting + storing ungated ASIN rows...")
+                    cur.execute(self._upsert_ungated_rows_sql())
 
-                _LOG.info("DB: query executed (%.1fs). Fetching rows...", time.time() - t0)
-                for r in cur.fetchall():
-                    if not isinstance(r, tuple) or len(r) < 3:
-                        continue
-                    asin = r[0]
-                    status = r[1]
-                    seller = r[2]
-                    update_date = r[3] if len(r) >= 4 else datetime.now()
-                    rows.append(
-                        UngatedRow(
-                            asin=str(asin),
-                            status=str(status),
-                            seller=str(seller),
-                            update_date=update_date,
+                    if self._enable_logging:
+                        _LOG.info("DB: query executed (%.1fs). Fetching rows...", time.time() - t0)
+                    
+                    for r in cur.fetchall():
+                        if not isinstance(r, tuple) or len(r) < 3:
+                            continue
+                        asin = r[0]
+                        status = r[1]
+                        seller = r[2]
+                        update_date = r[3] if len(r) >= 4 else datetime.now()
+                        
+                        # Validate data
+                        if not asin or not status:
+                            continue
+                            
+                        rows.append(
+                            UngatedRow(
+                                asin=str(asin).strip(),
+                                status=str(status).strip(),
+                                seller=str(seller).strip() if seller else "",
+                                update_date=update_date,
+                            )
                         )
-                    )
 
-        _LOG.info("DB: fetched %d rows (%.1fs)", len(rows), time.time() - t0)
+                    conn.commit()
+                    
+        except Exception as e:
+            _LOG.error("DB: Error fetching ungated rows: %s", e)
+            raise
+
+        if self._enable_logging:
+            _LOG.info("DB: fetched %d rows (%.1fs)", len(rows), time.time() - t0)
+        
         return rows
 
     def upsert_normalized_csv_to_test_united_state(self, csv_path: Path) -> int:
-        def _parse_decimal(v: str | None) -> Decimal | None:
+        """Upsert normalized CSV data into the united_state table."""
+        
+        def _parse_decimal(v: Optional[str]) -> Optional[Decimal]:
+            """Parse string to Decimal safely."""
             if v is None:
                 return None
             s = v.strip()
             if s == "":
                 return None
             try:
-                return Decimal(s)
-            except Exception:
+                # Remove any non-numeric characters except decimal point and minus sign
+                cleaned = ''.join(c for c in s if c.isdigit() or c in '.-')
+                if not cleaned:
+                    return None
+                return Decimal(cleaned)
+            except (InvalidOperation, ValueError):
                 return None
 
-        def _parse_int(v: str | None) -> int | None:
+        def _parse_int(v: Optional[str]) -> int:
+            """Parse string to integer safely."""
             if v is None:
-                return 0  # Default to 0 if None
+                return 0
             s = v.strip()
             if s == "":
-                return 0  # Default to 0 if empty
+                return 0
             try:
+                # Try to parse as float first to handle decimal strings
                 return int(float(s))
-            except Exception:
-                return 0  # Default to 0 if invalid
+            except (ValueError, TypeError):
+                return 0
 
-        def _parse_dt(v: str | None) -> datetime | None:
+        def _parse_dt(v: Optional[str]) -> Optional[datetime]:
+            """Parse string to datetime safely."""
             if v is None:
                 return None
             s = v.strip()
             if s == "":
                 return None
-            try:
-                return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return None
-
-        rows: list[dict[str, object]] = []
-        with csv_path.open("r", newline="", encoding="utf-8") as f:
-            import csv as _csv
-
-            r = _csv.DictReader(f)
-            for row in r:
-                asin = (row.get("ASIN") or "").strip()
-                if not asin:
+            
+            # Try multiple date formats
+            date_formats = [
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%d",
+                "%m/%d/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M",
+                "%m/%d/%Y"
+            ]
+            
+            for fmt in date_formats:
+                try:
+                    return datetime.strptime(s, fmt)
+                except ValueError:
                     continue
+            
+            return None
 
-                rows.append(
-                    {
+        if self._enable_logging:
+            _LOG.info("DB: processing CSV file: %s", csv_path)
+        
+        rows: List[Dict[str, Any]] = []
+        processed_count = 0
+        skipped_count = 0
+        
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8") as f:
+                reader = _csv.DictReader(f)
+                
+                # Validate required columns
+                required_columns = {"ASIN"}
+                missing_columns = required_columns - set(reader.fieldnames or [])
+                if missing_columns:
+                    raise ValueError(f"Missing required columns in CSV: {missing_columns}")
+                
+                for row_num, row in enumerate(reader, start=1):
+                    asin = (row.get("ASIN") or "").strip()
+                    if not asin:
+                        skipped_count += 1
+                        if self._enable_logging and skipped_count <= 10:
+                            _LOG.warning("DB: Skipping row %d: missing ASIN", row_num)
+                        continue
+
+                    processed_data = {
                         "ASIN": asin,
                         "US_BB_Price": _parse_decimal(row.get("US_BB_Price")),
                         "Package_Weight": _parse_decimal(row.get("Package_Weight")),
@@ -357,50 +447,134 @@ class DbService:
                         "last_updated": _parse_dt(row.get("last_updated")),
                         "Seller": (row.get("Seller") or "").strip() or None,
                     }
-                )
+                    
+                    rows.append(processed_data)
+                    processed_count += 1
+                    
+                    # Batch insert if we have enough rows
+                    if len(rows) >= self._batch_size:
+                        self._batch_insert_united_state(rows)
+                        rows = []
+        
+        except Exception as e:
+            _LOG.error("DB: Error reading CSV file %s: %s", csv_path, e)
+            raise
+
+        if self._enable_logging:
+            _LOG.info("DB: processed %d rows, skipped %d rows", processed_count, skipped_count)
 
         if not rows:
             return 0
 
-        with psycopg.connect(self._dsn) as conn:
+        # Insert remaining rows
+        inserted_count = self._batch_insert_united_state(rows)
+
+        # Get total count
+        try:
+            total = self._get_table_count(self._target_schema, self._united_state_table)
+            if self._enable_logging:
+                _LOG.info('DB: "%s"."%s" total rows=%s', self._target_schema, self._united_state_table, total)
+        except Exception as e:
+            if self._enable_logging:
+                _LOG.warning("DB: Could not get table count: %s", e)
+
+        return inserted_count
+
+    def _batch_insert_united_state(self, rows: List[Dict[str, Any]]) -> int:
+        """Batch insert rows into united_state table."""
+        if not rows:
+            return 0
+        
+        t0 = time.time()
+        inserted_count = 0
+        
+        try:
+            with psycopg.connect(self._dsn, connect_timeout=self._connect_timeout_s) as conn:
+                with conn.cursor() as cur:
+                    self._ensure_schema(cur, self._target_schema)
+                    self._ensure_united_state_table(cur)
+                    
+                    # Use executemany for batch insertion
+                    cur.executemany(self._upsert_united_state_sql(), rows)
+                    inserted_count = len(rows)
+                    
+                conn.commit()
+                
+        except Exception as e:
+            _LOG.error("DB: Error batch inserting %d rows: %s", len(rows), e)
+            # Try inserting one by one to identify problematic rows
+            inserted_count = self._insert_one_by_one(rows)
+        
+        if self._enable_logging:
+            _LOG.info('DB: upserted %d rows into "%s"."%s" in %.1fs', 
+                     inserted_count, self._target_schema, self._united_state_table, time.time() - t0)
+        
+        return inserted_count
+
+    def _insert_one_by_one(self, rows: List[Dict[str, Any]]) -> int:
+        """Insert rows one by one to handle errors individually."""
+        inserted_count = 0
+        
+        with psycopg.connect(self._dsn, connect_timeout=self._connect_timeout_s) as conn:
             with conn.cursor() as cur:
                 self._ensure_schema(cur, self._target_schema)
                 self._ensure_united_state_table(cur)
-                cur.executemany(self._upsert_united_state_sql(), rows)
+                
+                for row in rows:
+                    try:
+                        cur.execute(self._upsert_united_state_sql(), row)
+                        inserted_count += 1
+                    except Exception as e:
+                        _LOG.warning("DB: Failed to insert row with ASIN=%s: %s", row.get("ASIN"), e)
+                        conn.rollback()  # Rollback failed transaction
+                        # Continue with next row
+                        continue
+                    else:
+                        conn.commit()
+        
+        return inserted_count
 
-            conn.commit()
-
+    def _get_table_count(self, schema: str, table: str) -> int:
+        """Get total row count from a table."""
         try:
-            with psycopg.connect(self._dsn) as conn:
+            with psycopg.connect(self._dsn, connect_timeout=self._connect_timeout_s) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        sql.SQL("SELECT COUNT(*) FROM {};").format(
-                            _qual(self._target_schema, self._united_state_table)
-                        )
+                        sql.SQL("SELECT COUNT(*) FROM {};").format(_qual(schema, table))
                     )
-                    total = cur.fetchone()[0]
-            _LOG.info('DB: "%s"."%s" total rows=%s', self._target_schema, self._united_state_table, total)
+                    result = cur.fetchone()
+                    return result[0] if result else 0
         except Exception:
-            pass
+            return 0
 
-        _LOG.info('DB: upserted %d rows into "%s"."%s"', len(rows), self._target_schema, self._united_state_table)
-        return len(rows)
+    def test_connection(self) -> bool:
+        """Test database connection."""
+        try:
+            with psycopg.connect(self._dsn, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1;")
+                    result = cur.fetchone()
+                    return result is not None and result[0] == 1
+        except Exception as e:
+            _LOG.error("DB: Connection test failed: %s", e)
+            return False
 
 
-def fetch_new_ungated_rows() -> list[UngatedRow]:
+def fetch_new_ungated_rows() -> List[UngatedRow]:
     """Run the ungated ASINs query, store rows into the test table, and return them."""
     return DbService().fetch_new_ungated_rows()
 
 
-def fetch_and_insert_new_ungated_rows() -> list[UngatedRow]:
+def fetch_and_insert_new_ungated_rows() -> List[UngatedRow]:
     """Backward-compatible alias for fetch_new_ungated_rows()."""
     return fetch_new_ungated_rows()
 
 
-def asins_from_rows(rows: Iterable[UngatedRow]) -> list[str]:
+def asins_from_rows(rows: Iterable[UngatedRow]) -> List[str]:
     """Extract ASINs from UngatedRow objects."""
-    return [r.asin for r in rows]
+    return [r.asin for r in rows if r.asin]
 
 
 def upsert_normalized_csv_to_test_united_state(csv_path: Path) -> int:
+    """Upsert normalized CSV data into the united_state table."""
     return DbService().upsert_normalized_csv_to_test_united_state(csv_path)
