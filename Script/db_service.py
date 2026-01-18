@@ -284,8 +284,9 @@ class DbService:
                 "Sales_Rank_Drops" = EXCLUDED."Sales_Rank_Drops",
                 "Category" = EXCLUDED."Category",
                 "created_at" = COALESCE({}."created_at", EXCLUDED."created_at"),
-                "last_updated" = EXCLUDED."last_updated",
-                "Seller" = EXCLUDED."Seller";
+                "last_updated" = EXCLUDED."last_updated"
+                -- Note: Seller column is NOT updated - existing Seller value is preserved
+            ;
             """
         ).format(dest, dest)
 
