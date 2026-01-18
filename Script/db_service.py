@@ -179,25 +179,25 @@ class DbService:
     #         ).format(_qual(self._target_schema, self._united_state_table))
     #     )
     def _ensure_united_state_table(self, cur) -> None:
-    cur.execute(
-        sql.SQL(
-            """
-            CREATE TABLE IF NOT EXISTS {} (
-                "ASIN" character varying PRIMARY KEY,
-                "US_BB_Price" numeric,
-                "Package_Weight" numeric,
-                "FBA_Fee" numeric,
-                "Referral_Fee" numeric,
-                "Shipping_Cost" numeric,
-                "Sales_Rank_Drops" integer DEFAULT 0,
-                "Category" character varying,
-                "created_at" timestamp without time zone,
-                "last_updated" timestamp without time zone,
-                "Seller" character varying
-            );
-            """
-        ).format(_qual(self._target_schema, self._united_state_table))
-    )
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {} (
+                    "ASIN" character varying PRIMARY KEY,
+                    "US_BB_Price" numeric,
+                    "Package_Weight" numeric,
+                    "FBA_Fee" numeric,
+                    "Referral_Fee" numeric,
+                    "Shipping_Cost" numeric,
+                    "Sales_Rank_Drops" integer DEFAULT 0,
+                    "Category" character varying,
+                    "created_at" timestamp without time zone,
+                    "last_updated" timestamp without time zone,
+                    "Seller" character varying
+                );
+                """
+            ).format(_qual(self._target_schema, self._united_state_table))
+        )
 
     def _upsert_ungated_rows_sql(self) -> sql.SQL:
         return sql.SQL(
@@ -541,3 +541,5 @@ def asins_from_rows(rows: Iterable[UngatedRow]) -> list[str]:
 
 def upsert_normalized_csv_to_test_united_state(csv_path: Path) -> int:
     return DbService().upsert_normalized_csv_to_test_united_state(csv_path)
+
+
