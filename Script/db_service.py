@@ -190,11 +190,11 @@ class DbService:
                 """
                 CREATE TABLE IF NOT EXISTS {} (
                     "ASIN" character varying PRIMARY KEY,
-                    "US_BB_Price" numeric,
+                    "US_BB_Price" numeric NOT NULL DEFAULT 0,
                     "Package_Weight" numeric,
                     "FBA_Fee" numeric,
-                    "Referral_Fee" numeric,
-                    "Shipping_Cost" numeric,
+                    "Referral_Fee" numeric NOT NULL DEFAULT 0,
+                    "Shipping_Cost" numeric NOT NULL DEFAULT 0,
                     "Sales_Rank_Drops" integer DEFAULT 0,
                     "Category" character varying,
                     "created_at" timestamp without time zone,
@@ -355,15 +355,30 @@ class DbService:
     def upsert_normalized_csv_to_test_united_state(self, csv_path: Path) -> int:
         """Upsert normalized CSV data into the united_state table."""
         
-        def _parse_decimal(v: Optional[str]) -> Optional[Decimal]:
-            """Parse string to Decimal safely."""
+        def _parse_decimal_required(v: Optional[str]) -> Decimal:
+            """Parse string to Decimal safely, returning 0.00 for null/empty."""
+            if v is None:
+                return Decimal('0.00')
+            s = v.strip()
+            if s == "":
+                return Decimal('0.00')
+            try:
+                # Remove any non-numeric characters except decimal point and minus sign
+                cleaned = ''.join(c for c in s if c.isdigit() or c in '.-')
+                if not cleaned:
+                    return Decimal('0.00')
+                return Decimal(cleaned)
+            except (InvalidOperation, ValueError):
+                return Decimal('0.00')
+
+        def _parse_decimal_optional(v: Optional[str]) -> Optional[Decimal]:
+            """Parse string to Decimal safely, returning None for null/empty."""
             if v is None:
                 return None
             s = v.strip()
             if s == "":
                 return None
             try:
-                # Remove any non-numeric characters except decimal point and minus sign
                 cleaned = ''.join(c for c in s if c.isdigit() or c in '.-')
                 if not cleaned:
                     return None
@@ -437,11 +452,11 @@ class DbService:
 
                     processed_data = {
                         "ASIN": asin,
-                        "US_BB_Price": _parse_decimal(row.get("US_BB_Price")),
-                        "Package_Weight": _parse_decimal(row.get("Package_Weight")),
-                        "FBA_Fee": _parse_decimal(row.get("FBA_Fee")),
-                        "Referral_Fee": _parse_decimal(row.get("Referral_Fee")),
-                        "Shipping_Cost": _parse_decimal(row.get("Shipping_Cost")),
+                        "US_BB_Price": _parse_decimal_required(row.get("US_BB_Price")),
+                        "Package_Weight": _parse_decimal_optional(row.get("Package_Weight")),
+                        "FBA_Fee": _parse_decimal_optional(row.get("FBA_Fee")),
+                        "Referral_Fee": _parse_decimal_required(row.get("Referral_Fee")),
+                        "Shipping_Cost": _parse_decimal_required(row.get("Shipping_Cost")),
                         "Sales_Rank_Drops": _parse_int(row.get("Sales_Rank_Drops")),
                         "Category": (row.get("Category") or "").strip() or None,
                         "created_at": _parse_dt(row.get("created_at")),
