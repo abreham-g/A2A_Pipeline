@@ -3,13 +3,13 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests
 
 from .config import RocketSourceConfig
-from .errors import ApiRequestError, ApiResponseError, ScanFailedError, ScanTimeoutError
+from .errors import ApiRequestError, ApiResponseError, ScanFailedError, ScanTimeoutError, ScanInProgressError, RateLimitError
 from .utils import write_json_as_csv
 
 
@@ -35,6 +35,29 @@ def log_timing(name: str | None = None):
         return wrapper
 
     return decorator
+
+
+def get_retry_after(response: Optional[requests.Response]) -> int:
+    """Extract Retry-After header value or return default wait time."""
+    if response is None:
+        return 30  # Default 30 seconds
+    
+    retry_after = response.headers.get('Retry-After')
+    if retry_after:
+        try:
+            # Could be seconds (integer) or HTTP-date
+            return int(retry_after)
+        except ValueError:
+            # Try to parse HTTP-date format
+            try:
+                from email.utils import parsedate_to_datetime
+                import datetime
+                retry_time = parsedate_to_datetime(retry_after)
+                now = datetime.datetime.now(datetime.timezone.utc)
+                return max(1, int((retry_time - now).total_seconds()))
+            except:
+                pass
+    return 30  # Default 30 seconds
 
 
 def wrap_requests_errors():
@@ -67,6 +90,28 @@ def wrap_requests_errors():
                     except Exception:
                         snippet = None
 
+                # Handle HTTP 429 specifically for scan in progress
+                if status == 429:
+                    # Try to extract scan in progress message
+                    if resp and resp.text:
+                        try:
+                            error_data = resp.json()
+                            if isinstance(error_data, dict) and error_data.get("message") == "You already have a scan in progress.":
+                                # Re-raise as ScanInProgressError which can be caught separately
+                                raise ScanInProgressError("A scan is already in progress. Please wait for it to complete.") from e
+                        except:
+                            pass
+                    
+                    # Generic rate limiting or concurrent scan limit
+                    msg = "Too many requests or concurrent scan limit reached"
+                    if method and url and status is not None:
+                        msg = f"HTTP {status} {method} {url}"
+                    elif status is not None and url:
+                        msg = f"HTTP {status} {url}"
+                    
+                    _LOG.warning("%s - waiting before retry", msg)
+                    raise RateLimitError(msg, retry_after=get_retry_after(resp)) from e
+                    
                 msg = f"HTTP error"
                 if method and url and status is not None:
                     msg = f"HTTP {status} {method} {url}"
@@ -83,18 +128,26 @@ def wrap_requests_errors():
             except requests.RequestException as e:
                 _LOG.error("Request failed: %s", e)
                 raise ApiRequestError(str(e)) from e
+            except ScanInProgressError:
+                # Re-raise ScanInProgressError without wrapping
+                raise
+            except RateLimitError:
+                # Re-raise RateLimitError without wrapping
+                raise
         return wrapper
 
     return decorator
 
 
 class RocketSourceClient:
-    """High-level client for RocketSource scan automation."""
+    """High-level client for RocketSource scan automation with concurrency handling."""
     def __init__(self, config: RocketSourceConfig, session: requests.Session | None = None) -> None:
         """Create a new client with the given config and optional requests session."""
         self._config = config
         self._log = logging.getLogger(self.__class__.__name__)
         self._session = session or requests.Session()
+        self._max_retries = getattr(config, 'max_retries', 3)
+        self._retry_delay = getattr(config, 'retry_delay', 30)
 
     def close(self) -> None:
         """Close the underlying HTTP session."""
@@ -219,34 +272,103 @@ class RocketSourceClient:
             return None
 
         return _walk(d, 0)
+    
+    def check_existing_scans(self) -> list[dict[str, Any]]:
+        """Check for existing scans that might be in progress."""
+        try:
+            scans_data = self._list_scans(page=1)
+            scans = self._scan_items(scans_data)
+            
+            active_scans = []
+            for scan in scans:
+                status = self._extract_scan_status(scan)
+                if status and status.lower() not in ["done", "completed", "failed", "error"]:
+                    active_scans.append(scan)
+            
+            return active_scans
+        except Exception as e:
+            self._log.debug("Failed to check existing scans: %s", e)
+            return []
+
+    def _extract_scan_status(self, scan_item: Any) -> Optional[str]:
+        """Extract status from a scan item."""
+        if not isinstance(scan_item, dict):
+            return None
+        
+        # Try different possible locations for status
+        status = scan_item.get('status')
+        if isinstance(status, str):
+            return status
+            
+        attributes = scan_item.get('attributes', {})
+        if isinstance(attributes, dict):
+            status = attributes.get('status')
+            if isinstance(status, str):
+                return status
+        
+        data = scan_item.get('data', {})
+        if isinstance(data, dict):
+            status = data.get('status')
+            if isinstance(status, str):
+                return status
+        
+        return None
 
     @wrap_requests_errors()
     @log_timing(name="upload_csv")
     def upload_csv(self, csv_path: Path) -> str:
         """Upload a file and return an upload id (or scan id for API v3 /scans)."""
+        return self._upload_csv_with_retry(csv_path)
+
+    def _upload_csv_with_retry(self, csv_path: Path, retry_count: int = 0) -> str:
+        """Internal method with retry logic for upload."""
         url = self._url(self._config.upload_path)
-        with csv_path.open("rb") as f:
-            files = {self._config.upload_file_field: (csv_path.name, f, "text/csv")}
+        
+        try:
+            with csv_path.open("rb") as f:
+                files = {self._config.upload_file_field: (csv_path.name, f, "text/csv")}
 
-            if self._config.upload_path.rstrip("/") == "/scans":
-                # RocketSource API v3: create scans via multipart upload to /scans.
-                # The request must include an "attributes" form field containing JSON.
-                try:
-                    attrs = json.loads(self._config.scan_payload_template)
-                except Exception as e:
-                    raise ApiResponseError("scan_payload_template is not valid JSON") from e
+                if self._config.upload_path.rstrip("/") == "/scans":
+                    # RocketSource API v3: create scans via multipart upload to /scans.
+                    # The request must include an "attributes" form field containing JSON.
+                    try:
+                        attrs = json.loads(self._config.scan_payload_template)
+                    except Exception as e:
+                        raise ApiResponseError("scan_payload_template is not valid JSON") from e
 
-                resp = self._session.post(
-                    url,
-                    headers=self._headers(),
-                    files=files,
-                    data={"attributes": json.dumps(attrs)},
-                    timeout=120,
-                )
+                    resp = self._session.post(
+                        url,
+                        headers=self._headers(),
+                        files=files,
+                        data={"attributes": json.dumps(attrs)},
+                        timeout=120,
+                    )
+                else:
+                    resp = self._session.post(url, headers=self._headers(), files=files, timeout=120)
+            
+            resp.raise_for_status()
+            return self._extract_upload_id_from_response(resp)
+            
+        except RateLimitError as e:
+            if retry_count < self._max_retries:
+                wait_time = e.retry_after if hasattr(e, 'retry_after') else self._retry_delay
+                self._log.warning("Rate limited. Waiting %d seconds before retry %d/%d", 
+                                wait_time, retry_count + 1, self._max_retries)
+                time.sleep(wait_time)
+                return self._upload_csv_with_retry(csv_path, retry_count + 1)
             else:
-                resp = self._session.post(url, headers=self._headers(), files=files, timeout=120)
-        resp.raise_for_status()
+                self._log.error("Max retries exceeded for upload")
+                raise
+        except ScanInProgressError:
+            # Check if there's an existing scan we should wait for
+            active_scans = self.check_existing_scans()
+            if active_scans:
+                self._log.info("Found %d active scan(s). You may need to wait for them to complete.", len(active_scans))
+                # Optionally, you could poll the existing scan here
+            raise
 
+    def _extract_upload_id_from_response(self, resp: requests.Response) -> str:
+        """Extract upload/scan ID from response."""
         data = self._json(resp)
         upload_id = self._extract_first(data, ["upload_id", "file_id", "id", "uploadId", "fileId", "scan_id", "scanId"])
         if not upload_id:
@@ -306,18 +428,52 @@ class RocketSourceClient:
         except Exception:
             baseline_ids = set()
 
-        url = self._url("/scans")
-        with csv_path.open("rb") as f:
-            files = {self._config.upload_file_field: (csv_path.name, f, "text/csv")}
-            resp = self._session.post(
-                url,
-                headers=self._headers(),
-                files=files,
-                data={"attributes": json.dumps(attrs)},
-                timeout=120,
-            )
-        resp.raise_for_status()
+        # Attempt to create scan with retry logic
+        return self._create_scan_with_retry(csv_path, attrs, scan_name, baseline_ids)
 
+    def _create_scan_with_retry(self, csv_path: Path, attrs: Any, scan_name: Optional[str], 
+                               baseline_ids: set[str], retry_count: int = 0) -> str:
+        """Internal method with retry logic for scan creation."""
+        url = self._url("/scans")
+        
+        try:
+            with csv_path.open("rb") as f:
+                files = {self._config.upload_file_field: (csv_path.name, f, "text/csv")}
+                resp = self._session.post(
+                    url,
+                    headers=self._headers(),
+                    files=files,
+                    data={"attributes": json.dumps(attrs)},
+                    timeout=120,
+                )
+            resp.raise_for_status()
+
+            # Process response
+            return self._process_scan_creation_response(resp, scan_name, baseline_ids)
+            
+        except RateLimitError as e:
+            if retry_count < self._max_retries:
+                wait_time = e.retry_after if hasattr(e, 'retry_after') else self._retry_delay
+                self._log.warning("Rate limited during scan creation. Waiting %d seconds before retry %d/%d", 
+                                wait_time, retry_count + 1, self._max_retries)
+                time.sleep(wait_time)
+                return self._create_scan_with_retry(csv_path, attrs, scan_name, baseline_ids, retry_count + 1)
+            else:
+                self._log.error("Max retries exceeded for scan creation")
+                raise
+        except ScanInProgressError:
+            active_scans = self.check_existing_scans()
+            if active_scans:
+                self._log.info("Cannot start new scan. Found %d active scan(s).", len(active_scans))
+                for scan in active_scans:
+                    scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
+                    status = self._extract_scan_status(scan)
+                    self._log.info("  Scan %s: status=%s", scan_id, status)
+            raise
+
+    def _process_scan_creation_response(self, resp: requests.Response, scan_name: Optional[str], 
+                                       baseline_ids: set[str]) -> str:
+        """Process response from scan creation and extract scan ID."""
         header_id = self._extract_id_from_headers(resp)
         if header_id:
             return header_id
@@ -331,8 +487,15 @@ class RocketSourceClient:
         if scan_id:
             return scan_id
 
+        # If no ID in response, poll for new scan
+        return self._discover_scan_id_from_listing(scan_name, baseline_ids, resp)
+
+    def _discover_scan_id_from_listing(self, scan_name: Optional[str], baseline_ids: set[str], 
+                                      resp: requests.Response) -> str:
+        """Poll scan listing to discover newly created scan."""
         start = time.time()
         attempt = 0
+
         while True:
             attempt += 1
             if time.time() - start > self._config.poll_timeout_s:
@@ -344,7 +507,13 @@ class RocketSourceClient:
                     + (f". Response: {snippet}" if snippet else "")
                 )
 
-            scans = self._list_scans(page=1)
+            try:
+                scans = self._list_scans(page=1)
+            except Exception as e:
+                self._log.debug("Failed to list scans during discovery: %s", e)
+                time.sleep(self._config.poll_interval_s)
+                continue
+
             for item in self._scan_items(scans):
                 sid = self._extract_first(item, ["id", "scan_id", "scanId"])
                 if not sid:
@@ -483,18 +652,39 @@ class RocketSourceClient:
 
     def run_csv_scan(self, csv_path: Path, out_path: Path) -> tuple[str, str]:
         """Upload, poll, download, and save results; returns (upload_id, scan_id)."""
-        # API v3 default: create scan via /scans and treat returned id as scan id.
-        # Legacy mode (upload + start_scan) is kept for older endpoint configurations.
+        # Check for existing scans before starting
+        active_scans = self.check_existing_scans()
+        if active_scans:
+            self._log.warning("Found %d active scan(s) before starting new scan", len(active_scans))
+            for scan in active_scans:
+                scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
+                status = self._extract_scan_status(scan)
+                self._log.warning("  Active scan %s: status=%s", scan_id, status)
+        
         self._log.info("Starting scan for input=%s", csv_path)
-        if self._config.upload_path.rstrip("/") == "/scans" and "{upload_id}" not in self._config.scan_payload_template:
-            scan_id = self.create_scan(csv_path)
-            upload_id = scan_id
-        else:
-            upload_id = self.upload_csv(csv_path)
-            scan_id = self.start_scan(upload_id)
-        self._log.info("Scan created. upload_id=%s scan_id=%s", upload_id, scan_id)
-        self.poll_scan(scan_id)
-        resp = self.fetch_results(scan_id)
-        self.save_results_csv(resp, out_path)
-        self._log.info("Results saved to %s", out_path)
-        return upload_id, scan_id
+        
+        try:
+            # API v3 default: create scan via /scans and treat returned id as scan id.
+            # Legacy mode (upload + start_scan) is kept for older endpoint configurations.
+            if self._config.upload_path.rstrip("/") == "/scans" and "{upload_id}" not in self._config.scan_payload_template:
+                scan_id = self.create_scan(csv_path)
+                upload_id = scan_id
+            else:
+                upload_id = self.upload_csv(csv_path)
+                scan_id = self.start_scan(upload_id)
+                
+            self._log.info("Scan created. upload_id=%s scan_id=%s", upload_id, scan_id)
+            self.poll_scan(scan_id)
+            resp = self.fetch_results(scan_id)
+            self.save_results_csv(resp, out_path)
+            self._log.info("Results saved to %s", out_path)
+            return upload_id, scan_id
+            
+        except ScanInProgressError as e:
+            self._log.error("Cannot start scan: %s", str(e))
+            self._log.info("Consider waiting for existing scans to complete or implementing queueing")
+            raise
+        except RateLimitError as e:
+            self._log.error("Rate limited: %s", str(e))
+            self._log.info("Consider implementing exponential backoff or queueing system")
+            raise
