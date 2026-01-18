@@ -8,6 +8,7 @@ from pathlib import Path
 from Script.cli import main
 from Script.config import RocketSourceConfig
 from Script.db_service import asins_from_rows, fetch_new_ungated_rows, upsert_normalized_csv_to_test_united_state
+from Script.client import RocketSourceClient  # Add this import
 
 
 class RocketSourceAutomation:
@@ -115,7 +116,8 @@ class RocketSourceAutomation:
             return argv[1:]
         return argv
 
-    def run(self) -> int:
+    def run_with_direct_client(self) -> int:
+        """Run automation using the RocketSourceClient directly (bypassing CLI)."""
         rows = fetch_new_ungated_rows()
         asins = sorted(set(asins_from_rows(rows)))
         asin_to_seller = {r.asin: r.seller for r in rows if r.asin}
@@ -124,9 +126,6 @@ class RocketSourceAutomation:
             print("No new ASINs to scan (query returned 0 rows).")
             return 0
 
-        argv = self._argv_without_positional_csv()
-        argv = self._strip_out_flag(argv)
-
         with tempfile.TemporaryDirectory(prefix="rocketsource_") as tmp:
             tmp_dir = Path(tmp)
             input_csv = tmp_dir / "input.csv"
@@ -134,20 +133,34 @@ class RocketSourceAutomation:
             normalized_path = tmp_dir / "results_normalized.csv"
 
             self._write_asin_price_csv(input_csv, asins)
+            
+            # Create client and run scan
+            client = RocketSourceClient(self._cfg)
+            try:
+                upload_id, scan_id, results_bytes = client.run_csv_scan(input_csv)
+                
+                # Write results to temp file
+                out_path.write_bytes(results_bytes)
+                
+                if out_path.exists():
+                    self._normalize_results_csv(out_path, normalized_path, asin_to_seller, datetime.now())
+                    count = upsert_normalized_csv_to_test_united_state(normalized_path)
+                    logging.getLogger("rocketsource").info(
+                        "Upserted %d rows into target database table (see DB logs for schema/table)",
+                        count,
+                    )
+                    
+                return 0
+                
+            except Exception as e:
+                logging.error("Scan failed: %s", e)
+                return 1
+            finally:
+                client.close()
 
-            # Force the RocketSource CLI to write results into a temp file so we don't
-            # persist any CSV output into Data/ (or user-provided --out paths).
-            rc = main([str(input_csv), "--out", str(out_path), *argv])
-
-            if rc == 0 and out_path.exists():
-                self._normalize_results_csv(out_path, normalized_path, asin_to_seller, datetime.now())
-                count = upsert_normalized_csv_to_test_united_state(normalized_path)
-                logging.getLogger("rocketsource").info(
-                    "Upserted %d rows into target database table (see DB logs for schema/table)",
-                    count,
-                )
-
-            return rc
+    def run(self) -> int:
+        """Main run method - uses direct client approach."""
+        return self.run_with_direct_client()
 
 
 if __name__ == "__main__":
