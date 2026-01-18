@@ -50,7 +50,7 @@ def _redact_dsn(dsn: str) -> str:
     return " ".join(parts)
 
 
-def _env_str(name: str, default: str) -> str:
+def _env_str(name: str, default: str = "") -> str:  # Added default parameter
     v = os.environ.get(name)
     if v is None:
         return default
