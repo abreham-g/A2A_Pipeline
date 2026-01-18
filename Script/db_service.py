@@ -109,7 +109,7 @@ class DbService:
         self._umair_schema = _env_str("ROCKETSOURCE_UMAIR_SCHEMA")
         self._umair_table = _env_str("ROCKETSOURCE_UMAIR_TABLE")
 
-        self._asin_limit = _env_int("ROCKETSOURCE_ASIN_LIMIT")
+        # self._asin_limit = _env_int("ROCKETSOURCE_ASIN_LIMIT")
 
         _LOG.info("DB: target=%s", _redact_dsn(self._dsn))
         _LOG.info(
@@ -126,7 +126,7 @@ class DbService:
             self._umair_schema,
             self._umair_table,
         )
-        _LOG.info("DB: asin_limit=%s", self._asin_limit)
+        # _LOG.info("DB: asin_limit=%s", self._asin_limit)
 
         try:
             v = os.environ.get("ROCKETSOURCE_DB_CONNECT_TIMEOUT_S")
@@ -220,7 +220,6 @@ class DbService:
                 FROM combined_data
                 WHERE seller IS NOT NULL
                 ORDER BY seller, asin
-                LIMIT {limit}
             )
             INSERT INTO {} (asin, status, seller, update_date)
             SELECT asin, status, seller, CURRENT_TIMESTAMP
