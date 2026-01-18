@@ -97,19 +97,19 @@ class DbService:
         self._connect_timeout_s: int | None = None
         self._statement_timeout_ms: int | None = None
 
-        self._target_schema = _env_str("ROCKETSOURCE_TARGET_SCHEMA", "Core Data")
+        self._target_schema = _env_str("ROCKETSOURCE_TARGET_SCHEMA")
         self._ungated_table = _env_str(
             "ROCKETSOURCE_UNGATED_TABLE",
             "test_avg_book_sports_cd_tools_toys_ungated",
         )
-        self._united_state_table = _env_str("ROCKETSOURCE_UNITED_STATE_TABLE", "test_united_state")
+        self._united_state_table = _env_str("ROCKETSOURCE_UNITED_STATE_TABLE")
 
-        self._tirhak_schema = _env_str("ROCKETSOURCE_TIRHAK_SCHEMA", "gated")
-        self._tirhak_table = _env_str("ROCKETSOURCE_TIRHAK_TABLE", "tirhak_gating_results_avg_tools_asins")
-        self._umair_schema = _env_str("ROCKETSOURCE_UMAIR_SCHEMA", "Core Data")
-        self._umair_table = _env_str("ROCKETSOURCE_UMAIR_TABLE", "umair_gating_results_tools")
+        self._tirhak_schema = _env_str("ROCKETSOURCE_TIRHAK_SCHEMA")
+        self._tirhak_table = _env_str("ROCKETSOURCE_TIRHAK_TABLE")
+        self._umair_schema = _env_str("ROCKETSOURCE_UMAIR_SCHEMA")
+        self._umair_table = _env_str("ROCKETSOURCE_UMAIR_TABLE")
 
-        self._asin_limit = _env_int("ROCKETSOURCE_ASIN_LIMIT", 100)
+        self._asin_limit = _env_int("ROCKETSOURCE_ASIN_LIMIT")
 
         _LOG.info("DB: target=%s", _redact_dsn(self._dsn))
         _LOG.info(
@@ -159,25 +159,45 @@ class DbService:
             ).format(_qual(self._target_schema, self._ungated_table))
         )
 
+    # def _ensure_united_state_table(self, cur) -> None:
+    #     cur.execute(
+    #         sql.SQL(
+    #             """
+    #             CREATE TABLE IF NOT EXISTS {} (
+    #                 "ASIN" character varying PRIMARY KEY,
+    #                 "US_BB_Price" numeric,
+    #                 "Package_Weight" numeric,
+    #                 "FBA_Fee" numeric,
+    #                 "Referral_Fee" numeric,
+    #                 "Shipping_Cost" numeric,
+    #                 "Category" character varying,
+    #                 "created_at" timestamp without time zone,
+    #                 "last_updated" timestamp without time zone,
+    #                 "Seller" character varying
+    #             );
+    #             """
+    #         ).format(_qual(self._target_schema, self._united_state_table))
+    #     )
     def _ensure_united_state_table(self, cur) -> None:
-        cur.execute(
-            sql.SQL(
-                """
-                CREATE TABLE IF NOT EXISTS {} (
-                    "ASIN" character varying PRIMARY KEY,
-                    "US_BB_Price" numeric,
-                    "Package_Weight" numeric,
-                    "FBA_Fee" numeric,
-                    "Referral_Fee" numeric,
-                    "Shipping_Cost" numeric,
-                    "Category" character varying,
-                    "created_at" timestamp without time zone,
-                    "last_updated" timestamp without time zone,
-                    "Seller" character varying
-                );
-                """
-            ).format(_qual(self._target_schema, self._united_state_table))
-        )
+    cur.execute(
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {} (
+                "ASIN" character varying PRIMARY KEY,
+                "US_BB_Price" numeric,
+                "Package_Weight" numeric,
+                "FBA_Fee" numeric,
+                "Referral_Fee" numeric,
+                "Shipping_Cost" numeric,
+                "Sales_Rank_Drops" integer DEFAULT 0,
+                "Category" character varying,
+                "created_at" timestamp without time zone,
+                "last_updated" timestamp without time zone,
+                "Seller" character varying
+            );
+            """
+        ).format(_qual(self._target_schema, self._united_state_table))
+    )
 
     def _upsert_ungated_rows_sql(self) -> sql.SQL:
         return sql.SQL(
@@ -219,6 +239,46 @@ class DbService:
             limit=sql.Literal(self._asin_limit),
         )
 
+    # def _upsert_united_state_sql(self) -> sql.SQL:
+    #     dest = _qual(self._target_schema, self._united_state_table)
+    #     return sql.SQL(
+    #         """
+    #         INSERT INTO {} (
+    #             "ASIN",
+    #             "US_BB_Price",
+    #             "Package_Weight",
+    #             "FBA_Fee",
+    #             "Referral_Fee",
+    #             "Shipping_Cost",
+    #             "Category",
+    #             "created_at",
+    #             "last_updated",
+    #             "Seller"
+    #         ) VALUES (
+    #             %(ASIN)s,
+    #             %(US_BB_Price)s,
+    #             %(Package_Weight)s,
+    #             %(FBA_Fee)s,
+    #             %(Referral_Fee)s,
+    #             %(Shipping_Cost)s,
+    #             %(Category)s,
+    #             %(created_at)s,
+    #             %(last_updated)s,
+    #             %(Seller)s
+    #         )
+    #         ON CONFLICT ("ASIN") DO UPDATE
+    #         SET
+    #             "US_BB_Price" = EXCLUDED."US_BB_Price",
+    #             "Package_Weight" = EXCLUDED."Package_Weight",
+    #             "FBA_Fee" = EXCLUDED."FBA_Fee",
+    #             "Referral_Fee" = EXCLUDED."Referral_Fee",
+    #             "Shipping_Cost" = EXCLUDED."Shipping_Cost",
+    #             "Category" = EXCLUDED."Category",
+    #             "created_at" = COALESCE({}."created_at", EXCLUDED."created_at"),
+    #             "last_updated" = EXCLUDED."last_updated",
+    #             "Seller" = EXCLUDED."Seller";
+    #         """
+    #     ).format(dest, dest)
     def _upsert_united_state_sql(self) -> sql.SQL:
         dest = _qual(self._target_schema, self._united_state_table)
         return sql.SQL(
@@ -230,6 +290,7 @@ class DbService:
                 "FBA_Fee",
                 "Referral_Fee",
                 "Shipping_Cost",
+                "Sales_Rank_Drops",
                 "Category",
                 "created_at",
                 "last_updated",
@@ -241,6 +302,7 @@ class DbService:
                 %(FBA_Fee)s,
                 %(Referral_Fee)s,
                 %(Shipping_Cost)s,
+                %(Sales_Rank_Drops)s,
                 %(Category)s,
                 %(created_at)s,
                 %(last_updated)s,
@@ -253,6 +315,7 @@ class DbService:
                 "FBA_Fee" = EXCLUDED."FBA_Fee",
                 "Referral_Fee" = EXCLUDED."Referral_Fee",
                 "Shipping_Cost" = EXCLUDED."Shipping_Cost",
+                "Sales_Rank_Drops" = EXCLUDED."Sales_Rank_Drops",
                 "Category" = EXCLUDED."Category",
                 "created_at" = COALESCE({}."created_at", EXCLUDED."created_at"),
                 "last_updated" = EXCLUDED."last_updated",
@@ -301,6 +364,80 @@ class DbService:
         _LOG.info("DB: fetched %d rows (%.1fs)", len(rows), time.time() - t0)
         return rows
 
+    # def upsert_normalized_csv_to_test_united_state(self, csv_path: Path) -> int:
+    #     def _parse_decimal(v: str | None) -> Decimal | None:
+    #         if v is None:
+    #             return None
+    #         s = v.strip()
+    #         if s == "":
+    #             return None
+    #         try:
+    #             return Decimal(s)
+    #         except Exception:
+    #             return None
+
+    #     def _parse_dt(v: str | None) -> datetime | None:
+    #         if v is None:
+    #             return None
+    #         s = v.strip()
+    #         if s == "":
+    #             return None
+    #         try:
+    #             return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    #         except Exception:
+    #             return None
+
+    #     rows: list[dict[str, object]] = []
+    #     with csv_path.open("r", newline="", encoding="utf-8") as f:
+    #         import csv as _csv
+
+    #         r = _csv.DictReader(f)
+    #         for row in r:
+    #             asin = (row.get("ASIN") or "").strip()
+    #             if not asin:
+    #                 continue
+
+    #             rows.append(
+    #                 {
+    #                     "ASIN": asin,
+    #                     "US_BB_Price": _parse_decimal(row.get("US_BB_Price")),
+    #                     "Package_Weight": _parse_decimal(row.get("Package_Weight")),
+    #                     "FBA_Fee": _parse_decimal(row.get("FBA_Fee")),
+    #                     "Referral_Fee": _parse_decimal(row.get("Referral_Fee")),
+    #                     "Shipping_Cost": _parse_decimal(row.get("Shipping_Cost")),
+    #                     "Category": (row.get("Category") or "").strip() or None,
+    #                     "created_at": _parse_dt(row.get("created_at")),
+    #                     "last_updated": _parse_dt(row.get("last_updated")),
+    #                     "Seller": (row.get("Seller") or "").strip() or None,
+    #                 }
+    #             )
+
+    #     if not rows:
+    #         return 0
+
+    #     with psycopg.connect(self._dsn) as conn:
+    #         with conn.cursor() as cur:
+    #             self._ensure_schema(cur, self._target_schema)
+    #             self._ensure_united_state_table(cur)
+    #             cur.executemany(self._upsert_united_state_sql(), rows)
+
+    #         conn.commit()
+
+    #     try:
+    #         with psycopg.connect(self._dsn) as conn:
+    #             with conn.cursor() as cur:
+    #                 cur.execute(
+    #                     sql.SQL("SELECT COUNT(*) FROM {};").format(
+    #                         _qual(self._target_schema, self._united_state_table)
+    #                     )
+    #                 )
+    #                 total = cur.fetchone()[0]
+    #         _LOG.info('DB: "%s"."%s" total rows=%s', self._target_schema, self._united_state_table, total)
+    #     except Exception:
+    #         pass
+
+    #     _LOG.info('DB: upserted %d rows into "%s"."%s"', len(rows), self._target_schema, self._united_state_table)
+    #     return len(rows)
     def upsert_normalized_csv_to_test_united_state(self, csv_path: Path) -> int:
         def _parse_decimal(v: str | None) -> Decimal | None:
             if v is None:
@@ -312,6 +449,17 @@ class DbService:
                 return Decimal(s)
             except Exception:
                 return None
+
+        def _parse_int(v: str | None) -> int | None:
+            if v is None:
+                return None
+            s = v.strip()
+            if s == "":
+                return 0  # Default to 0 if empty
+            try:
+                return int(float(s))
+            except Exception:
+                return 0  # Default to 0 if invalid
 
         def _parse_dt(v: str | None) -> datetime | None:
             if v is None:
@@ -342,6 +490,7 @@ class DbService:
                         "FBA_Fee": _parse_decimal(row.get("FBA_Fee")),
                         "Referral_Fee": _parse_decimal(row.get("Referral_Fee")),
                         "Shipping_Cost": _parse_decimal(row.get("Shipping_Cost")),
+                        "Sales_Rank_Drops": _parse_int(row.get("Sales_Rank_Drops")),  # Added this line
                         "Category": (row.get("Category") or "").strip() or None,
                         "created_at": _parse_dt(row.get("created_at")),
                         "last_updated": _parse_dt(row.get("last_updated")),
@@ -375,7 +524,6 @@ class DbService:
 
         _LOG.info('DB: upserted %d rows into "%s"."%s"', len(rows), self._target_schema, self._united_state_table)
         return len(rows)
-
 
 def fetch_new_ungated_rows() -> list[UngatedRow]:
     """Run the ungated ASINs query, store rows into the test table, and return them."""
