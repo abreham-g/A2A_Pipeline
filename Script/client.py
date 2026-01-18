@@ -5,12 +5,13 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
+from email.utils import parsedate_to_datetime
+import datetime
 
 import requests
 
 from .config import RocketSourceConfig
 from .errors import ApiRequestError, ApiResponseError, ScanFailedError, ScanTimeoutError, ScanInProgressError, RateLimitError
-from .utils import write_json_as_csv
 
 
 _LOG = logging.getLogger(__name__)
@@ -50,8 +51,6 @@ def get_retry_after(response: Optional[requests.Response]) -> int:
         except ValueError:
             # Try to parse HTTP-date format
             try:
-                from email.utils import parsedate_to_datetime
-                import datetime
                 retry_time = parsedate_to_datetime(retry_after)
                 now = datetime.datetime.now(datetime.timezone.utc)
                 return max(1, int((retry_time - now).total_seconds()))
@@ -148,6 +147,8 @@ class RocketSourceClient:
         self._session = session or requests.Session()
         self._max_retries = getattr(config, 'max_retries', 3)
         self._retry_delay = getattr(config, 'retry_delay', 30)
+        self._exponential_backoff = getattr(config, 'exponential_backoff', True)
+        self._base_delay = getattr(config, 'base_delay', 1)  # Base delay for exponential backoff
 
     def close(self) -> None:
         """Close the underlying HTTP session."""
@@ -282,7 +283,8 @@ class RocketSourceClient:
             active_scans = []
             for scan in scans:
                 status = self._extract_scan_status(scan)
-                if status and status.lower() not in ["done", "completed", "failed", "error"]:
+                # FIXED: Include "Success" as a completed status
+                if status and status.lower() not in ["done", "completed", "complete", "finished", "success", "succeeded", "failed", "error"]:
                     active_scans.append(scan)
             
             return active_scans
@@ -352,6 +354,11 @@ class RocketSourceClient:
         except RateLimitError as e:
             if retry_count < self._max_retries:
                 wait_time = e.retry_after if hasattr(e, 'retry_after') else self._retry_delay
+                # Apply exponential backoff if enabled
+                if self._exponential_backoff:
+                    wait_time = self._base_delay * (2 ** retry_count)
+                    wait_time = min(wait_time, 300)  # Cap at 5 minutes
+                
                 self._log.warning("Rate limited. Waiting %d seconds before retry %d/%d", 
                                 wait_time, retry_count + 1, self._max_retries)
                 time.sleep(wait_time)
@@ -364,7 +371,15 @@ class RocketSourceClient:
             active_scans = self.check_existing_scans()
             if active_scans:
                 self._log.info("Found %d active scan(s). You may need to wait for them to complete.", len(active_scans))
-                # Optionally, you could poll the existing scan here
+                # Check if any scan is actually active vs completed
+                for scan in active_scans:
+                    scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
+                    status = self._extract_scan_status(scan)
+                    self._log.info("  Scan %s: status=%s", scan_id, status)
+                    
+                    # If scan is actually completed (like "Success"), we can proceed
+                    if status and status.lower() in ["done", "completed", "complete", "finished", "success", "succeeded"]:
+                        self._log.info("  Scan %s appears to be completed. You may be able to proceed.", scan_id)
             raise
 
     def _extract_upload_id_from_response(self, resp: requests.Response) -> str:
@@ -454,6 +469,11 @@ class RocketSourceClient:
         except RateLimitError as e:
             if retry_count < self._max_retries:
                 wait_time = e.retry_after if hasattr(e, 'retry_after') else self._retry_delay
+                # Apply exponential backoff if enabled
+                if self._exponential_backoff:
+                    wait_time = self._base_delay * (2 ** retry_count)
+                    wait_time = min(wait_time, 300)  # Cap at 5 minutes
+                
                 self._log.warning("Rate limited during scan creation. Waiting %d seconds before retry %d/%d", 
                                 wait_time, retry_count + 1, self._max_retries)
                 time.sleep(wait_time)
@@ -469,6 +489,10 @@ class RocketSourceClient:
                     scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
                     status = self._extract_scan_status(scan)
                     self._log.info("  Scan %s: status=%s", scan_id, status)
+                    
+                    # Provide specific advice based on status
+                    if status and status.lower() in ["done", "completed", "complete", "finished", "success", "succeeded"]:
+                        self._log.info("  Note: Scan %s appears to be completed. The system may still be processing it.", scan_id)
             raise
 
     def _process_scan_creation_response(self, resp: requests.Response, scan_name: Optional[str], 
@@ -561,6 +585,7 @@ class RocketSourceClient:
     @log_timing(name="poll_scan")
     def poll_scan(self, scan_id: str) -> str:
         """Poll scan status until completion/failure/timeout."""
+        # FIXED: Added "Success" to done_statuses
         done_statuses = {"done", "completed", "complete", "finished", "success", "succeeded"}
         fail_statuses = {"failed", "error", "errored", "canceled", "cancelled"}
 
@@ -638,20 +663,78 @@ class RocketSourceClient:
         resp.raise_for_status()
         return resp
 
-    def save_results_csv(self, resp: requests.Response, out_path: Path) -> None:
-        """Save results to CSV, converting JSON payloads to CSV if needed."""
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        content_type = (resp.headers.get("Content-Type") or "").lower()
+    def get_results_content(self, scan_id: str) -> bytes:
+        """Get scan results as bytes (for database storage)."""
+        resp = self.fetch_results(scan_id)
+        return resp.content
 
-        if "text/csv" in content_type or out_path.suffix.lower() == ".csv" and "application/json" not in content_type:
-            out_path.write_bytes(resp.content)
-            return
+    def get_results_text(self, scan_id: str) -> str:
+        """Get scan results as text (for database storage)."""
+        resp = self.fetch_results(scan_id)
+        return resp.text
 
-        data = self._json(resp)
-        write_json_as_csv(data, out_path)
+    def run_csv_scan(self, csv_path: Path) -> tuple[str, str, bytes]:
+        """Upload, poll, download, and return results; returns (upload_id, scan_id, results_bytes)."""
+        # Check for existing scans before starting
+        active_scans = self.check_existing_scans()
+        if active_scans:
+            self._log.warning("Found %d active scan(s) before starting new scan", len(active_scans))
+            for scan in active_scans:
+                scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
+                status = self._extract_scan_status(scan)
+                self._log.warning("  Active scan %s: status=%s", scan_id, status)
+                
+                # Provide advice for completed scans
+                if status and status.lower() in ["done", "completed", "complete", "finished", "success", "succeeded"]:
+                    self._log.info("  Note: Scan %s appears to be completed. You may be able to proceed.", scan_id)
+        
+        self._log.info("Starting scan for input=%s", csv_path)
+        
+        try:
+            # API v3 default: create scan via /scans and treat returned id as scan id.
+            # Legacy mode (upload + start_scan) is kept for older endpoint configurations.
+            if self._config.upload_path.rstrip("/") == "/scans" and "{upload_id}" not in self._config.scan_payload_template:
+                scan_id = self.create_scan(csv_path)
+                upload_id = scan_id
+            else:
+                upload_id = self.upload_csv(csv_path)
+                scan_id = self.start_scan(upload_id)
+                
+            self._log.info("Scan created. upload_id=%s scan_id=%s", upload_id, scan_id)
+            
+            # Poll for completion
+            final_status = self.poll_scan(scan_id)
+            self._log.info("Scan completed with status: %s", final_status)
+            
+            # Get results as bytes (for database storage)
+            results_bytes = self.get_results_content(scan_id)
+            self._log.info("Results downloaded (%d bytes)", len(results_bytes))
+            
+            return upload_id, scan_id, results_bytes
+            
+        except ScanInProgressError as e:
+            self._log.error("Cannot start scan: %s", str(e))
+            
+            # Check if we can provide more specific advice
+            active_scans = self.check_existing_scans()
+            completed_scans = []
+            for scan in active_scans:
+                status = self._extract_scan_status(scan)
+                if status and status.lower() in ["done", "completed", "complete", "finished", "success", "succeeded"]:
+                    completed_scans.append(scan)
+            
+            if completed_scans:
+                self._log.info("Found %d completed scan(s). The system may still be processing them.", len(completed_scans))
+                self._log.info("Consider waiting a few minutes and trying again.")
+            
+            raise
+        except RateLimitError as e:
+            self._log.error("Rate limited: %s", str(e))
+            self._log.info("Implementing exponential backoff with base delay of %d seconds", self._base_delay)
+            raise
 
-    def run_csv_scan(self, csv_path: Path, out_path: Path) -> tuple[str, str]:
-        """Upload, poll, download, and save results; returns (upload_id, scan_id)."""
+    def run_csv_scan_without_results(self, csv_path: Path) -> tuple[str, str]:
+        """Upload, poll, and return only scan info; returns (upload_id, scan_id)."""
         # Check for existing scans before starting
         active_scans = self.check_existing_scans()
         if active_scans:
@@ -674,17 +757,17 @@ class RocketSourceClient:
                 scan_id = self.start_scan(upload_id)
                 
             self._log.info("Scan created. upload_id=%s scan_id=%s", upload_id, scan_id)
-            self.poll_scan(scan_id)
-            resp = self.fetch_results(scan_id)
-            self.save_results_csv(resp, out_path)
-            self._log.info("Results saved to %s", out_path)
+            
+            # Poll for completion
+            final_status = self.poll_scan(scan_id)
+            self._log.info("Scan completed with status: %s", final_status)
+            
             return upload_id, scan_id
             
         except ScanInProgressError as e:
             self._log.error("Cannot start scan: %s", str(e))
-            self._log.info("Consider waiting for existing scans to complete or implementing queueing")
             raise
         except RateLimitError as e:
             self._log.error("Rate limited: %s", str(e))
-            self._log.info("Consider implementing exponential backoff or queueing system")
+            self._log.info("Implementing exponential backoff with base delay of %d seconds", self._base_delay)
             raise
