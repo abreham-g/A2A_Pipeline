@@ -4,11 +4,11 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import List
 
-from Script.cli import main
 from Script.config import RocketSourceConfig
 from Script.db_service import asins_from_rows, fetch_new_ungated_rows, upsert_normalized_csv_to_test_united_state
-from Script.client import RocketSourceClient  # Add this import
+from Script.client import RocketSourceClient
 
 
 class RocketSourceAutomation:
@@ -24,38 +24,6 @@ class RocketSourceAutomation:
             w.writerow(["ASIN", "PRICE"])
             for asin in asins:
                 w.writerow([asin, price])
-
-    @staticmethod
-    def _out_path(cfg: RocketSourceConfig, argv: list[str]) -> Path:
-        out_arg: str | None = None
-        for i, a in enumerate(argv):
-            if a == "--out" and i + 1 < len(argv):
-                out_arg = argv[i + 1]
-                break
-
-        if not out_arg:
-            return cfg.data_dir / "scan_results.csv"
-
-        p = Path(out_arg)
-        if p.is_absolute():
-            return p
-        return cfg.data_dir / p
-
-    @staticmethod
-    def _strip_out_flag(argv: list[str]) -> list[str]:
-        out: list[str] = []
-        skip_next = False
-        for a in argv:
-            if skip_next:
-                skip_next = False
-                continue
-            if a == "--out":
-                skip_next = True
-                continue
-            if a.startswith("--out="):
-                continue
-            out.append(a)
-        return out
 
     @staticmethod
     def _normalize_results_csv(
@@ -110,14 +78,8 @@ class RocketSourceAutomation:
                         }
                     )
 
-    def _argv_without_positional_csv(self) -> list[str]:
-        argv = list(self._argv)
-        if argv and not argv[0].startswith("-"):
-            return argv[1:]
-        return argv
-
-    def run_with_direct_client(self) -> int:
-        """Run automation using the RocketSourceClient directly (bypassing CLI)."""
+    def run(self) -> int:
+        """Main run method - handles large ASIN lists by splitting into batches."""
         rows = fetch_new_ungated_rows()
         asins = sorted(set(asins_from_rows(rows)))
         asin_to_seller = {r.asin: r.seller for r in rows if r.asin}
@@ -126,6 +88,43 @@ class RocketSourceAutomation:
             print("No new ASINs to scan (query returned 0 rows).")
             return 0
 
+        self._log = logging.getLogger("rocketsource")
+        self._log.info("Found %d ASINs to scan", len(asins))
+
+        # If there are too many ASINs, split them into batches
+        # RocketSource might have limits on how many ASINs per scan
+        max_asins_per_scan = 50000  # Adjust based on RocketSource limits
+        asin_batches = self._split_asins_into_batches(asins, max_asins_per_scan)
+
+        total_processed = 0
+        for batch_num, batch_asins in enumerate(asin_batches, 1):
+            self._log.info("Processing batch %d/%d with %d ASINs", 
+                         batch_num, len(asin_batches), len(batch_asins))
+            
+            try:
+                result = self._process_asin_batch(batch_asins, asin_to_seller)
+                if result == 0:
+                    total_processed += len(batch_asins)
+                else:
+                    self._log.error("Batch %d failed", batch_num)
+                    return result
+            except Exception as e:
+                self._log.error("Error processing batch %d: %s", batch_num, e)
+                return 1
+
+        self._log.info("Successfully processed %d ASINs across %d batches", 
+                      total_processed, len(asin_batches))
+        return 0
+
+    def _split_asins_into_batches(self, asins: List[str], batch_size: int) -> List[List[str]]:
+        """Split ASINs into batches of manageable size."""
+        batches = []
+        for i in range(0, len(asins), batch_size):
+            batches.append(asins[i:i + batch_size])
+        return batches
+
+    def _process_asin_batch(self, asins: List[str], asin_to_seller: dict[str, str]) -> int:
+        """Process a single batch of ASINs."""
         with tempfile.TemporaryDirectory(prefix="rocketsource_") as tmp:
             tmp_dir = Path(tmp)
             input_csv = tmp_dir / "input.csv"
@@ -133,11 +132,19 @@ class RocketSourceAutomation:
             normalized_path = tmp_dir / "results_normalized.csv"
 
             self._write_asin_price_csv(input_csv, asins)
-            
+
             # Create client and run scan
             client = RocketSourceClient(self._cfg)
             try:
-                upload_id, scan_id, results_bytes = client.run_csv_scan(input_csv)
+                # Wait for any active scans to complete first
+                self._log.info("Checking for active scans...")
+                if client.wait_for_active_scans(timeout=1800):  # Wait up to 30 minutes
+                    self._log.info("No active scans, proceeding with scan...")
+                else:
+                    self._log.error("Timed out waiting for active scans to complete")
+                    return 1
+
+                upload_id, scan_id, results_bytes = client.run_csv_scan(input_csv, out_path)
                 
                 # Write results to temp file
                 out_path.write_bytes(results_bytes)
@@ -145,22 +152,15 @@ class RocketSourceAutomation:
                 if out_path.exists():
                     self._normalize_results_csv(out_path, normalized_path, asin_to_seller, datetime.now())
                     count = upsert_normalized_csv_to_test_united_state(normalized_path)
-                    logging.getLogger("rocketsource").info(
-                        "Upserted %d rows into target database table (see DB logs for schema/table)",
-                        count,
-                    )
+                    self._log.info("Upserted %d rows into target database table", count)
                     
                 return 0
                 
             except Exception as e:
-                logging.error("Scan failed: %s", e)
+                self._log.error("Scan failed: %s", e)
                 return 1
             finally:
                 client.close()
-
-    def run(self) -> int:
-        """Main run method - uses direct client approach."""
-        return self.run_with_direct_client()
 
 
 if __name__ == "__main__":

@@ -149,6 +149,8 @@ class RocketSourceClient:
         self._retry_delay = getattr(config, 'retry_delay', 30)
         self._exponential_backoff = getattr(config, 'exponential_backoff', True)
         self._base_delay = getattr(config, 'base_delay', 1)  # Base delay for exponential backoff
+        self._wait_for_active_scans = getattr(config, 'wait_for_active_scans', True)  # Wait for active scans to complete
+        self._max_wait_time = getattr(config, 'max_wait_time', 3600)  # Max 1 hour to wait for active scan
 
     def close(self) -> None:
         """Close the underlying HTTP session."""
@@ -316,6 +318,34 @@ class RocketSourceClient:
         
         return None
 
+    def wait_for_active_scans(self, timeout: int = 3600) -> bool:
+        """Wait for any active scans to complete."""
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            active_scans = self.check_existing_scans()
+            
+            if not active_scans:
+                self._log.info("No active scans found. Proceeding with new scan.")
+                return True
+            
+            # Log status of active scans
+            for scan in active_scans:
+                scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
+                status = self._extract_scan_status(scan)
+                self._log.info("Waiting for scan %s (status: %s) to complete...", scan_id, status)
+            
+            # Check if any scan has been running too long
+            elapsed = time.time() - start_time
+            if elapsed > 300:  # After 5 minutes
+                self._log.warning("Still waiting for active scans after %.0f seconds", elapsed)
+            
+            # Wait before checking again
+            time.sleep(30)  # Check every 30 seconds
+        
+        self._log.error("Timed out waiting for active scans to complete after %d seconds", timeout)
+        return False
+
     @wrap_requests_errors()
     @log_timing(name="upload_csv")
     def upload_csv(self, csv_path: Path) -> str:
@@ -367,20 +397,17 @@ class RocketSourceClient:
                 self._log.error("Max retries exceeded for upload")
                 raise
         except ScanInProgressError:
-            # Check if there's an existing scan we should wait for
-            active_scans = self.check_existing_scans()
-            if active_scans:
-                self._log.info("Found %d active scan(s). You may need to wait for them to complete.", len(active_scans))
-                # Check if any scan is actually active vs completed
-                for scan in active_scans:
-                    scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
-                    status = self._extract_scan_status(scan)
-                    self._log.info("  Scan %s: status=%s", scan_id, status)
-                    
-                    # If scan is actually completed (like "Success"), we can proceed
-                    if status and status.lower() in ["done", "completed", "complete", "finished", "success", "succeeded"]:
-                        self._log.info("  Scan %s appears to be completed. You may be able to proceed.", scan_id)
-            raise
+            # If we should wait for active scans, do that first
+            if self._wait_for_active_scans:
+                self._log.info("Scan in progress. Waiting for existing scans to complete...")
+                if self.wait_for_active_scans(self._max_wait_time):
+                    # Try again after waiting
+                    return self._upload_csv_with_retry(csv_path, retry_count)
+                else:
+                    raise ScanInProgressError("Timed out waiting for existing scans to complete.")
+            else:
+                # Just raise the error without waiting
+                raise
 
     def _extract_upload_id_from_response(self, resp: requests.Response) -> str:
         """Extract upload/scan ID from response."""
@@ -482,18 +509,23 @@ class RocketSourceClient:
                 self._log.error("Max retries exceeded for scan creation")
                 raise
         except ScanInProgressError:
-            active_scans = self.check_existing_scans()
-            if active_scans:
-                self._log.info("Cannot start new scan. Found %d active scan(s).", len(active_scans))
-                for scan in active_scans:
-                    scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
-                    status = self._extract_scan_status(scan)
-                    self._log.info("  Scan %s: status=%s", scan_id, status)
-                    
-                    # Provide specific advice based on status
-                    if status and status.lower() in ["done", "completed", "complete", "finished", "success", "succeeded"]:
-                        self._log.info("  Note: Scan %s appears to be completed. The system may still be processing it.", scan_id)
-            raise
+            # If we should wait for active scans, do that first
+            if self._wait_for_active_scans:
+                self._log.info("Scan in progress. Waiting for existing scans to complete...")
+                if self.wait_for_active_scans(self._max_wait_time):
+                    # Try again after waiting
+                    return self._create_scan_with_retry(csv_path, attrs, scan_name, baseline_ids, retry_count)
+                else:
+                    raise ScanInProgressError("Timed out waiting for existing scans to complete.")
+            else:
+                active_scans = self.check_existing_scans()
+                if active_scans:
+                    self._log.info("Cannot start new scan. Found %d active scan(s).", len(active_scans))
+                    for scan in active_scans:
+                        scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
+                        status = self._extract_scan_status(scan)
+                        self._log.info("  Scan %s: status=%s", scan_id, status)
+                raise
 
     def _process_scan_creation_response(self, resp: requests.Response, scan_name: Optional[str], 
                                        baseline_ids: set[str]) -> str:
@@ -673,7 +705,7 @@ class RocketSourceClient:
         resp = self.fetch_results(scan_id)
         return resp.text
 
-    def run_csv_scan(self, csv_path: Path) -> tuple[str, str, bytes]:
+    def run_csv_scan(self, csv_path: Path, out_path: Path = None) -> tuple[str, str, Optional[bytes]]:
         """Upload, poll, download, and return results; returns (upload_id, scan_id, results_bytes)."""
         # Check for existing scans before starting
         active_scans = self.check_existing_scans()
@@ -709,6 +741,12 @@ class RocketSourceClient:
             # Get results as bytes (for database storage)
             results_bytes = self.get_results_content(scan_id)
             self._log.info("Results downloaded (%d bytes)", len(results_bytes))
+            
+            # Save to file if out_path provided (backward compatibility)
+            if out_path:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(results_bytes)
+                self._log.info("Results saved to %s", out_path)
             
             return upload_id, scan_id, results_bytes
             
