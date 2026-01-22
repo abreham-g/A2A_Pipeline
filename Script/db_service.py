@@ -211,7 +211,7 @@ class DbService:
             """
             WITH combined_data AS (
                 SELECT
-                    COALESCE(t.asin, u.asin) as asin,
+                    COALESCE(t."ASIN", u."ASIN") as asin,
                     'UNGATED' as status,
                     CASE
                         WHEN t.status = 'UNGATED' AND u.status = 'UNGATED' THEN 'B'
@@ -220,7 +220,7 @@ class DbService:
                     END as seller
                 FROM {} t
                 FULL OUTER JOIN {} u
-                    ON t.asin = u.asin
+                    ON t."ASIN" = u."ASIN"
             ),
             selected AS (
                 SELECT asin, status, seller
