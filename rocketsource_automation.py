@@ -2,6 +2,7 @@ import csv
 import logging
 import sys
 import tempfile
+import io
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -127,11 +128,16 @@ class RocketSourceAutomation:
         """Process a single batch of ASINs."""
         with tempfile.TemporaryDirectory(prefix="rocketsource_") as tmp:
             tmp_dir = Path(tmp)
-            input_csv = tmp_dir / "input.csv"
             out_path = tmp_dir / "results.csv"
             normalized_path = tmp_dir / "results_normalized.csv"
 
-            self._write_asin_price_csv(input_csv, asins)
+            # Build input CSV in-memory to avoid writing an input file to disk
+            sio = io.StringIO()
+            w = csv.writer(sio)
+            w.writerow(["ASIN", "PRICE"])
+            for asin in asins:
+                w.writerow([asin, 0.001])
+            csv_bytes = sio.getvalue().encode("utf-8")
 
             # Create client and run scan
             client = RocketSourceClient(self._cfg)
@@ -144,7 +150,19 @@ class RocketSourceAutomation:
                     self._log.error("Timed out waiting for active scans to complete")
                     return 1
 
-                upload_id, scan_id, results_bytes = client.run_csv_scan(input_csv, out_path)
+                # Upload in-memory CSV and start scan
+                upload_id = client.upload_bytes("input.csv", csv_bytes)
+
+                # Determine if upload returned a scan id or if we need to start a scan
+                if self._cfg.upload_path.rstrip("/") == "/scans" and "{upload_id}" not in self._cfg.scan_payload_template:
+                    scan_id = upload_id
+                else:
+                    scan_id = client.start_scan(upload_id)
+
+                # Poll for completion and fetch results
+                final_status = client.poll_scan(scan_id)
+                results_bytes = client.get_results_content(scan_id)
+                self._log.info("Scan completed with status: %s", final_status)
                 
                 # Write results to temp file
                 out_path.write_bytes(results_bytes)

@@ -133,6 +133,8 @@ class DbService:
         # Performance and logging settings
         self._batch_size = _env_int("ROCKETSOURCE_DB_BATCH_SIZE", 1000)
         self._enable_logging = _env_bool("ROCKETSOURCE_DB_ENABLE_LOGGING", True)
+        # Limit for ASINs when building scans (used by historical scan selection)
+        self._asin_limit = _env_int("ROCKETSOURCE_ASIN_LIMIT", 1000)
 
         # Log configuration
         if self._enable_logging:
@@ -207,25 +209,34 @@ class DbService:
 
     def _upsert_ungated_rows_sql(self) -> sql.Composed:
         """Generate SQL for upserting ungated rows."""
+        # Select up to _asin_limit ASINs from the tirhak source first, then
+        # LEFT JOIN matching rows from the umair table. This implements the
+        # requested behavior of taking a slice from Tirhak and finding matches
+        # in Umair rather than a full outer join of both sources.
         return sql.SQL(
             """
-            WITH combined_data AS (
+            WITH tirhak_selected AS (
+                SELECT asin, status
+                FROM {}
+                LIMIT {}
+            ),
+            combined AS (
                 SELECT
-                    COALESCE(t.asin, u.asin) as asin,
+                    t.asin as asin,
                     'UNGATED' as status,
                     CASE
                         WHEN t.status = 'UNGATED' AND u.status = 'UNGATED' THEN 'B'
                         WHEN t.status != 'UNGATED' AND u.status = 'UNGATED' THEN 'T'
                         WHEN t.status = 'UNGATED' AND u.status != 'UNGATED' THEN 'U'
+                        ELSE NULL
                     END as seller
-                FROM {} t
-                FULL OUTER JOIN {} u
+                FROM tirhak_selected t
+                LEFT JOIN {} u
                     ON t.asin = u.asin
             ),
             selected AS (
-                SELECT asin, status, seller
-                FROM combined_data
-                WHERE seller IS NOT NULL
+                SELECT asin, status, COALESCE(seller, '') as seller
+                FROM combined
                 ORDER BY seller, asin
             )
             INSERT INTO {} (asin, status, seller, update_date)
@@ -240,6 +251,7 @@ class DbService:
             """
         ).format(
             _qual(self._tirhak_schema, self._tirhak_table),
+            sql.Literal(self._asin_limit),
             _qual(self._umair_schema, self._umair_table),
             _qual(self._target_schema, self._ungated_table),
         )

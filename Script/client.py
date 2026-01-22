@@ -9,6 +9,7 @@ from email.utils import parsedate_to_datetime
 import datetime
 
 import requests
+import io
 
 from .config import RocketSourceConfig
 from .errors import ApiRequestError, ApiResponseError, ScanFailedError, ScanTimeoutError, ScanInProgressError, RateLimitError
@@ -352,6 +353,12 @@ class RocketSourceClient:
         """Upload a file and return an upload id (or scan id for API v3 /scans)."""
         return self._upload_csv_with_retry(csv_path)
 
+    @wrap_requests_errors()
+    @log_timing(name="upload_bytes")
+    def upload_bytes(self, name: str, data: bytes) -> str:
+        """Upload CSV bytes (in-memory) and return an upload id (or scan id for API v3 /scans)."""
+        return self._upload_bytes_with_retry(name, data)
+
     def _upload_csv_with_retry(self, csv_path: Path, retry_count: int = 0) -> str:
         """Internal method with retry logic for upload."""
         url = self._url(self._config.upload_path)
@@ -407,6 +414,56 @@ class RocketSourceClient:
                     raise ScanInProgressError("Timed out waiting for existing scans to complete.")
             else:
                 # Just raise the error without waiting
+                raise
+
+    def _upload_bytes_with_retry(self, name: str, data: bytes, retry_count: int = 0) -> str:
+        """Internal method with retry logic for uploading in-memory bytes."""
+        url = self._url(self._config.upload_path)
+
+        try:
+            files = {self._config.upload_file_field: (name, io.BytesIO(data), "text/csv")}
+
+            if self._config.upload_path.rstrip("/") == "/scans":
+                try:
+                    attrs = json.loads(self._config.scan_payload_template)
+                except Exception as e:
+                    raise ApiResponseError("scan_payload_template is not valid JSON") from e
+
+                resp = self._session.post(
+                    url,
+                    headers=self._headers(),
+                    files=files,
+                    data={"attributes": json.dumps(attrs)},
+                    timeout=120,
+                )
+            else:
+                resp = self._session.post(url, headers=self._headers(), files=files, timeout=120)
+
+            resp.raise_for_status()
+            return self._extract_upload_id_from_response(resp)
+
+        except RateLimitError as e:
+            if retry_count < self._max_retries:
+                wait_time = e.retry_after if hasattr(e, 'retry_after') else self._retry_delay
+                if self._exponential_backoff:
+                    wait_time = self._base_delay * (2 ** retry_count)
+                    wait_time = min(wait_time, 300)
+
+                self._log.warning("Rate limited. Waiting %d seconds before retry %d/%d", 
+                                wait_time, retry_count + 1, self._max_retries)
+                time.sleep(wait_time)
+                return self._upload_bytes_with_retry(name, data, retry_count + 1)
+            else:
+                self._log.error("Max retries exceeded for upload")
+                raise
+        except ScanInProgressError:
+            if self._wait_for_active_scans:
+                self._log.info("Scan in progress. Waiting for existing scans to complete...")
+                if self.wait_for_active_scans(self._max_wait_time):
+                    return self._upload_bytes_with_retry(name, data, retry_count)
+                else:
+                    raise ScanInProgressError("Timed out waiting for existing scans to complete.")
+            else:
                 raise
 
     def _extract_upload_id_from_response(self, resp: requests.Response) -> str:
@@ -809,3 +866,120 @@ class RocketSourceClient:
             self._log.error("Rate limited: %s", str(e))
             self._log.info("Implementing exponential backoff with base delay of %d seconds", self._base_delay)
             raise
+
+    def run_csv_scan_bytes(self, name: str, data: bytes, out_path: Path = None) -> tuple[str, str, Optional[bytes]]:
+        """Upload CSV bytes (in-memory), poll, download, and return results.
+        Returns (upload_id, scan_id, results_bytes).
+        """
+        # Check for existing scans before starting
+        active_scans = self.check_existing_scans()
+        if active_scans:
+            self._log.warning("Found %d active scan(s) before starting new scan", len(active_scans))
+            for scan in active_scans:
+                scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
+                status = self._extract_scan_status(scan)
+                self._log.warning("  Active scan %s: status=%s", scan_id, status)
+
+        self._log.info("Starting scan for in-memory input=%s (bytes=%d)", name, len(data))
+
+        try:
+            if self._config.upload_path.rstrip("/") == "/scans" and "{upload_id}" not in self._config.scan_payload_template:
+                # Create scan via API v3 using bytes
+                scan_id = self._create_scan_bytes(name, data)
+                upload_id = scan_id
+            else:
+                upload_id = self.upload_bytes(name, data)
+                scan_id = self.start_scan(upload_id)
+
+            self._log.info("Scan created. upload_id=%s scan_id=%s", upload_id, scan_id)
+
+            # Poll for completion
+            final_status = self.poll_scan(scan_id)
+            self._log.info("Scan completed with status: %s", final_status)
+
+            # Get results as bytes
+            results_bytes = self.get_results_content(scan_id)
+            self._log.info("Results downloaded (%d bytes)", len(results_bytes))
+
+            # Save to file if out_path provided
+            if out_path:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(results_bytes)
+                self._log.info("Results saved to %s", out_path)
+
+            return upload_id, scan_id, results_bytes
+
+        except ScanInProgressError:
+            raise
+        except RateLimitError as e:
+            self._log.error("Rate limited: %s", str(e))
+            self._log.info("Implementing exponential backoff with base delay of %d seconds", self._base_delay)
+            raise
+
+    def _create_scan_bytes(self, name: str, data: bytes, retry_count: int = 0) -> str:
+        """Create a scan via POST /scans using in-memory bytes and return the scan id."""
+        url = self._url("/scans")
+
+        # Prepare baseline ids to help discovery if response is 'ok'
+        scan_name: str | None = None
+        try:
+            attrs = json.loads(self._config.scan_payload_template)
+            if isinstance(attrs, dict):
+                opts = attrs.get("options")
+                if isinstance(opts, dict) and isinstance(opts.get("name"), str):
+                    scan_name = opts.get("name")
+        except Exception:
+            attrs = None
+
+        baseline_ids: set[str] = set()
+        try:
+            existing = self._list_scans(page=1)
+            for item in self._scan_items(existing):
+                sid = self._extract_first(item, ["id", "scan_id", "scanId"])
+                if sid:
+                    baseline_ids.add(sid)
+        except Exception:
+            baseline_ids = set()
+
+        try:
+            files = {self._config.upload_file_field: (name, io.BytesIO(data), "text/csv")}
+            resp = self._session.post(
+                url,
+                headers=self._headers(),
+                files=files,
+                data={"attributes": json.dumps(attrs)} if attrs is not None else None,
+                timeout=120,
+            )
+            resp.raise_for_status()
+            return self._process_scan_creation_response(resp, scan_name, baseline_ids)
+
+        except RateLimitError as e:
+            if retry_count < self._max_retries:
+                wait_time = e.retry_after if hasattr(e, 'retry_after') else self._retry_delay
+                if self._exponential_backoff:
+                    wait_time = self._base_delay * (2 ** retry_count)
+                    wait_time = min(wait_time, 300)
+
+                self._log.warning("Rate limited during scan creation. Waiting %d seconds before retry %d/%d", 
+                                wait_time, retry_count + 1, self._max_retries)
+                time.sleep(wait_time)
+                return self._create_scan_bytes(name, data, retry_count + 1)
+            else:
+                self._log.error("Max retries exceeded for scan creation")
+                raise
+        except ScanInProgressError:
+            if self._wait_for_active_scans:
+                self._log.info("Scan in progress. Waiting for existing scans to complete...")
+                if self.wait_for_active_scans(self._max_wait_time):
+                    return self._create_scan_bytes(name, data, retry_count)
+                else:
+                    raise ScanInProgressError("Timed out waiting for existing scans to complete.")
+            else:
+                active_scans = self.check_existing_scans()
+                if active_scans:
+                    self._log.info("Cannot start new scan. Found %d active scan(s).", len(active_scans))
+                    for scan in active_scans:
+                        scan_id = self._extract_first(scan, ["id", "scan_id", "scanId"])
+                        status = self._extract_scan_status(scan)
+                        self._log.info("  Scan %s: status=%s", scan_id, status)
+                raise
