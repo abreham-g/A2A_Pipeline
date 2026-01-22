@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List
 
 from Script.config import RocketSourceConfig
-from Script.db_service import asins_from_rows, fetch_new_ungated_rows, upsert_normalized_csv_to_test_united_state
+from Script.db_service import asins_from_rows, fetch_new_ungated_rows, fetch_all_asins, upsert_normalized_csv_to_test_united_state
 from Script.client import RocketSourceClient
 
 
@@ -57,7 +57,6 @@ class RocketSourceAutomation:
                         "Category",
                         "created_at",
                         "last_updated",
-                        "Seller",
                     ],
                 )
                 w.writeheader()
@@ -74,18 +73,19 @@ class RocketSourceAutomation:
                             "Category": pick(row, ["Category"]),
                             "created_at": created_at,
                             "last_updated": created_at,
-                            "Seller": asin_to_seller.get(asin, ""),
                         }
                     )
 
     def run(self) -> int:
         """Main run method - handles large ASIN lists by splitting into batches."""
-        rows = fetch_new_ungated_rows()
-        asins = sorted(set(asins_from_rows(rows)))
-        asin_to_seller = {r.asin: r.seller for r in rows if r.asin}
+        # Simplified approach: just get all ASINs from source tables
+        asins = sorted(set(fetch_all_asins()))
+        
+        # Empty seller mapping since we're not doing status checks
+        asin_to_seller = {}
 
         if not asins:
-            print("No new ASINs to scan (query returned 0 rows).")
+            print("No ASINs found in source tables.")
             return 0
 
         self._log = logging.getLogger("rocketsource")

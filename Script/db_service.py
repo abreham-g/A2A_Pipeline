@@ -205,6 +205,24 @@ class DbService:
             ).format(_qual(self._target_schema, self._united_state_table))
         )
 
+    def _get_all_asins_sql(self) -> sql.Composed:
+        """Generate SQL to get all unique ASINs from source tables."""
+        return sql.SQL(
+            """
+            WITH all_asins AS (
+                SELECT "ASIN"
+                FROM {}
+                UNION
+                SELECT "ASIN"
+                FROM {}
+            )
+            SELECT "ASIN" FROM all_asins ORDER BY "ASIN";
+            """
+        ).format(
+            _qual(self._tirhak_schema, self._tirhak_table),
+            _qual(self._umair_schema, self._umair_table),
+        )
+
     def _upsert_ungated_rows_sql(self) -> sql.Composed:
         """Generate SQL for upserting ungated rows."""
         return sql.SQL(
@@ -259,8 +277,7 @@ class DbService:
                 "Sales_Rank_Drops",
                 "Category",
                 "created_at",
-                "last_updated",
-                "Seller"
+                "last_updated"
             ) VALUES (
                 %(ASIN)s,
                 %(US_BB_Price)s,
@@ -271,8 +288,7 @@ class DbService:
                 %(Sales_Rank_Drops)s,
                 %(Category)s,
                 %(created_at)s,
-                %(last_updated)s,
-                %(Seller)s
+                %(last_updated)s
             )
             ON CONFLICT ("ASIN") DO UPDATE
             SET
@@ -289,6 +305,45 @@ class DbService:
             ;
             """
         ).format(dest, dest)
+
+    def fetch_all_asins(self) -> List[str]:
+        """Fetch all unique ASINs from source tables."""
+        asins: List[str] = []
+
+        if self._enable_logging:
+            _LOG.info("DB: connecting...")
+        
+        t0 = time.time()
+
+        try:
+            with psycopg.connect(self._dsn, connect_timeout=self._connect_timeout_s) as conn:
+                with conn.cursor() as cur:
+                    if self._statement_timeout_ms is not None and self._statement_timeout_ms > 0:
+                        cur.execute(f"SET LOCAL statement_timeout = {self._statement_timeout_ms}")
+
+                    if self._enable_logging:
+                        _LOG.info("DB: fetching all ASINs from source tables...")
+                    cur.execute(self._get_all_asins_sql())
+
+                    if self._enable_logging:
+                        _LOG.info("DB: query executed (%.1fs). Fetching rows...", time.time() - t0)
+                    
+                    for r in cur.fetchall():
+                        if isinstance(r, tuple) and len(r) > 0:
+                            asin = r[0]
+                            if asin:
+                                asins.append(str(asin).strip())
+
+                    conn.commit()
+                    
+        except Exception as e:
+            _LOG.error("DB: Error fetching ASINs: %s", e)
+            raise
+
+        if self._enable_logging:
+            _LOG.info("DB: fetched %d ASINs (%.1fs)", len(asins), time.time() - t0)
+        
+        return asins
 
     def fetch_new_ungated_rows(self) -> List[UngatedRow]:
         """Run the ungated ASINs query, store rows into the test table, and return them."""
@@ -446,7 +501,7 @@ class DbService:
                         "Category": (row.get("Category") or "").strip() or None,
                         "created_at": _parse_dt(row.get("created_at")),
                         "last_updated": _parse_dt(row.get("last_updated")),
-                        "Seller": (row.get("Seller") or "").strip() or None,
+                        # Seller column excluded to preserve existing values in database
                     }
                     
                     rows.append(processed_data)
@@ -559,6 +614,11 @@ class DbService:
         except Exception as e:
             _LOG.error("DB: Connection test failed: %s", e)
             return False
+
+
+def fetch_all_asins() -> List[str]:
+    """Fetch all unique ASINs from source tables."""
+    return DbService().fetch_all_asins()
 
 
 def fetch_new_ungated_rows() -> List[UngatedRow]:
