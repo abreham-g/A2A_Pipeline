@@ -75,7 +75,7 @@ class RocketSourceConfig:
     upload_file_field: str = "file"
 
     scan_path: str = "/scans"
-    scan_payload_template: str = '{"mapping":{"id":0,"cost":1},"options":{"marketplace_id":"US","name":"Automated Scan"}}'
+    scan_payload_template: str = '{"mapping":{"id":0,"cost":1},"options":{"marketplace_id":"UK","name":"Automated Scan"}}'
 
     status_path_template: str = "/scans/{scan_id}"
     results_path_template: str = "/scans/{scan_id}/download?type=csv"
