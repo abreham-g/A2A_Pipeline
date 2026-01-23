@@ -200,7 +200,7 @@ class RocketSourceConfig:
             upload_file_field=_env("ROCKETSOURCE_UPLOAD_FILE_FIELD") or "file",
             scan_path=_env("ROCKETSOURCE_SCAN_PATH") or "/scans",
             scan_payload_template=_env("ROCKETSOURCE_SCAN_PAYLOAD")
-            or '{"mapping":{"id":0,"cost":1},"options":{"marketplace_id":"US","name":"Automated Scan"}}',
+            or '{"mapping":{"id":0,"cost":1},"options":{"marketplace_id":"UK","name":"Automated Scan"}}',
             status_path_template=_env("ROCKETSOURCE_STATUS_PATH_TEMPLATE") or "/scans/{scan_id}",
             results_path_template=_env("ROCKETSOURCE_RESULTS_PATH_TEMPLATE") or "/scans/{scan_id}/download?type=csv",
             poll_interval_s=_float_env("ROCKETSOURCE_POLL_INTERVAL", 3.0),
