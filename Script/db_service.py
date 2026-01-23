@@ -274,7 +274,6 @@ class DbService:
                 "FBA_Fee",
                 "Referral_Fee",
                 "Shipping_Cost",
-                "Sales_Rank_Drops",
                 "Category",
                 "created_at",
                 "last_updated"
@@ -285,7 +284,6 @@ class DbService:
                 %(FBA_Fee)s,
                 %(Referral_Fee)s,
                 %(Shipping_Cost)s,
-                %(Sales_Rank_Drops)s,
                 %(Category)s,
                 %(created_at)s,
                 %(last_updated)s
@@ -297,11 +295,10 @@ class DbService:
                 "FBA_Fee" = EXCLUDED."FBA_Fee",
                 "Referral_Fee" = EXCLUDED."Referral_Fee",
                 "Shipping_Cost" = EXCLUDED."Shipping_Cost",
-                "Sales_Rank_Drops" = EXCLUDED."Sales_Rank_Drops",
                 "Category" = EXCLUDED."Category",
                 "created_at" = COALESCE({}."created_at", EXCLUDED."created_at"),
                 "last_updated" = EXCLUDED."last_updated"
-                -- Note: Seller column is NOT updated - existing Seller value is preserved
+                -- Note: Seller and Sales_Rank_Drops columns are NOT updated - existing values are preserved
             ;
             """
         ).format(dest, dest)
@@ -497,11 +494,10 @@ class DbService:
                         "FBA_Fee": _parse_decimal(row.get("FBA_Fee")),
                         "Referral_Fee": _parse_decimal(row.get("Referral_Fee")),
                         "Shipping_Cost": _parse_decimal(row.get("Shipping_Cost")),
-                        "Sales_Rank_Drops": _parse_int(row.get("Sales_Rank_Drops")),
                         "Category": (row.get("Category") or "").strip() or None,
                         "created_at": _parse_dt(row.get("created_at")),
                         "last_updated": _parse_dt(row.get("last_updated")),
-                        # Seller column excluded to preserve existing values in database
+                        # Seller and Sales_Rank_Drops columns excluded to preserve existing values in database
                     }
                     
                     rows.append(processed_data)
