@@ -195,7 +195,6 @@ class DbService:
                     "FBA_Fee" numeric NOT NULL DEFAULT 0,
                     "Referral_Fee" numeric NOT NULL DEFAULT 0,
                     "Shipping_Cost" numeric NOT NULL DEFAULT 0,
-                    "Sales_Rank_Drops" integer DEFAULT 0,
                     "Category" character varying,
                     "created_at" timestamp without time zone,
                     "last_updated" timestamp without time zone,
