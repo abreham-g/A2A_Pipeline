@@ -196,9 +196,8 @@ class DbService:
                     "Referral_Fee" numeric NOT NULL DEFAULT 0,
                     "Shipping_Cost" numeric NOT NULL DEFAULT 0,
                     "Category" character varying,
-                    "created_at" timestamp without time zone,
-                    "last_updated" timestamp without time zone,
-                    "Seller" character varying
+                    "Last_Updated" timestamp without time zone,
+                    "created_at" timestamp without time zone
                 );
                 """
             ).format(_qual(self._target_schema, self._united_state_table))
@@ -274,8 +273,8 @@ class DbService:
                 "Referral_Fee",
                 "Shipping_Cost",
                 "Category",
-                "created_at",
-                "last_updated"
+                "Last_Updated",
+                "created_at"
             ) VALUES (
                 %(ASIN)s,
                 %(US_BB_Price)s,
@@ -284,8 +283,8 @@ class DbService:
                 %(Referral_Fee)s,
                 %(Shipping_Cost)s,
                 %(Category)s,
-                %(created_at)s,
-                %(last_updated)s
+                %(Last_Updated)s,
+                %(created_at)s
             )
             ON CONFLICT ("ASIN") DO UPDATE
             SET
@@ -295,9 +294,9 @@ class DbService:
                 "Referral_Fee" = EXCLUDED."Referral_Fee",
                 "Shipping_Cost" = EXCLUDED."Shipping_Cost",
                 "Category" = EXCLUDED."Category",
-                "created_at" = COALESCE({}."created_at", EXCLUDED."created_at"),
-                "last_updated" = EXCLUDED."last_updated"
-                -- Note: Seller and Sales_Rank_Drops columns are NOT updated - existing values are preserved
+                "Last_Updated" = EXCLUDED."Last_Updated",
+                "created_at" = COALESCE({}."created_at", EXCLUDED."created_at")
+                -- Note: Seller column is NOT included - existing Seller values are preserved
             ;
             """
         ).format(dest, dest)
@@ -494,9 +493,8 @@ class DbService:
                         "Referral_Fee": _parse_decimal(row.get("Referral_Fee")),
                         "Shipping_Cost": _parse_decimal(row.get("Shipping_Cost")),
                         "Category": (row.get("Category") or "").strip() or None,
+                        "Last_Updated": _parse_dt(row.get("last_updated")),
                         "created_at": _parse_dt(row.get("created_at")),
-                        "last_updated": _parse_dt(row.get("last_updated")),
-                        # Seller and Sales_Rank_Drops columns excluded to preserve existing values in database
                     }
                     
                     rows.append(processed_data)
