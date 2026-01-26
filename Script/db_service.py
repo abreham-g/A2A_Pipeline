@@ -190,7 +190,7 @@ class DbService:
                 """
                 CREATE TABLE IF NOT EXISTS {} (
                     "ASIN" character varying PRIMARY KEY,
-                    "US_BB_Price" numeric NOT NULL DEFAULT 0,
+                    "UK_BB_Price" numeric NOT NULL DEFAULT 0,
                     "Package_Weight" numeric NOT NULL DEFAULT 0,
                     "FBA_Fee" numeric NOT NULL DEFAULT 0,
                     "Referral_Fee" numeric NOT NULL DEFAULT 0,
@@ -267,7 +267,7 @@ class DbService:
             """
             INSERT INTO {} (
                 "ASIN",
-                "US_BB_Price",
+                "UK_BB_Price",
                 "Package_Weight",
                 "FBA_Fee",
                 "Referral_Fee",
@@ -277,7 +277,7 @@ class DbService:
                 "created_at"
             ) VALUES (
                 %(ASIN)s,
-                %(US_BB_Price)s,
+                %(UK_BB_Price)s,
                 %(Package_Weight)s,
                 %(FBA_Fee)s,
                 %(Referral_Fee)s,
@@ -288,7 +288,7 @@ class DbService:
             )
             ON CONFLICT ("ASIN") DO UPDATE
             SET
-                "US_BB_Price" = EXCLUDED."US_BB_Price",
+                "UK_BB_Price" = EXCLUDED."UK_BB_Price",
                 "Package_Weight" = EXCLUDED."Package_Weight",
                 "FBA_Fee" = EXCLUDED."FBA_Fee",
                 "Referral_Fee" = EXCLUDED."Referral_Fee",
@@ -487,7 +487,7 @@ class DbService:
 
                     processed_data = {
                         "ASIN": asin,
-                        "US_BB_Price": _parse_decimal(row.get("US_BB_Price")),
+                        "UK_BB_Price": _parse_decimal(row.get("US_BB_Price")),
                         "Package_Weight": _parse_decimal(row.get("Package_Weight")),
                         "FBA_Fee": _parse_decimal(row.get("FBA_Fee")),
                         "Referral_Fee": _parse_decimal(row.get("Referral_Fee")),
